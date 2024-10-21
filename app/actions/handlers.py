@@ -88,7 +88,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
 
     base_url = integration.base_url or EBIRD_API
 
-    if(action_config.region_code):
+    if action_config.region_code:
         if((action_config.latitude and action_config.latitude != 0) or
            (action_config.longitude and action_config.longitude != 0)):
             raise ConfigurationValidationError("If region code is included, latitude and longitude should be blank.")
@@ -110,13 +110,18 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
     to_send = []
     async for ob in obs:
         to_send.append(_transform_ebird_to_gundi_event(ob))
+
+    if 0 == (item_count := len(to_send)):
+        logger.info(f"No new eBird observations for integration {integration.name}")
+        return {'result': {'events_extracted': item_count}}
     
-    logger.info(f"Submitting {len(to_send)} eBird observations to Gundi")
+    logger.info(f"Submitting {item_count} eBird observations for integration {integration.name}")
+
     response = await send_events_to_gundi(
             events=to_send,
             integration_id=str(integration.id))
 
-    return {'result': {'events_extracted': 0}}
+    return {'result': {'events_extracted': item_count}}
 
 async def _get_from_ebird(url: str, api_key: str, params: dict):
     headers = {
