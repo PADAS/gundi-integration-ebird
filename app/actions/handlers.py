@@ -116,7 +116,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
             events=to_send,
             integration_id=str(integration.id))
 
-    return {'result': {'events_extracted': 0}}
+    return {'result': {'events_extracted': len(to_send)}}
 
 async def _get_from_ebird(url: str, api_key: str, params: dict):
     headers = {
