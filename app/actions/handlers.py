@@ -137,8 +137,10 @@ async def _get_recent_observations_by_region(base_url: str, api_key: str, num_da
         }
         url = f"{base_url}/data/obs/{region_code}/recent"
         logger.info(f"Loading eBird observations for last {num_days} days near region code {region_code}.")
-        
-        return await _get_recent_observations(url, api_key, params, species_code)
+
+        async for item in _get_recent_observations(url, api_key, params, species_code):
+            yield item
+
 
 async def _get_recent_observations_by_location(base_url: str, api_key: str, num_days: int, lat: float, 
                                                lng: float, dist: float, species_code: str = None,
@@ -156,19 +158,22 @@ async def _get_recent_observations_by_location(base_url: str, api_key: str, num_
             yield item
 
 
-async def _get_recent_observations(url, api_key, params, species_code: str = None):
+async def _get_recent_observations(base_url, api_key, params, species_code: str = None):
 
         if(species_code):
             species = species_code.split(",")
             for specie in species:
-                url = f"{url}/{specie}"
-                obs = _get_from_ebird(url, params=params)
-                logger.info(f"Loading observations for species {species}.")
-                for ob in obs:
-                    yield parse_obj_as(eBirdObservation, ob)
+                url = f"{base_url}/{specie}"
+                obs = await _get_from_ebird(url, api_key, params=params)
+                if obs:
+                    logger.info(f"Loading observations for specie '{specie}'.")
+                    for ob in obs:
+                        yield parse_obj_as(eBirdObservation, ob)
+                else:
+                    logger.info(f"No observations found for specie '{specie}'.")
         
         else:
-            obs = await _get_from_ebird(url, api_key, params=params)
+            obs = await _get_from_ebird(base_url, api_key, params=params)
             for ob in obs:
                 yield parse_obj_as(eBirdObservation, ob)
 
