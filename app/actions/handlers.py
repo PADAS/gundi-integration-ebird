@@ -111,10 +111,14 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
     async for ob in obs:
         to_send.append(_transform_ebird_to_gundi_event(ob))
     
-    logger.info(f"Submitting {len(to_send)} eBird observations to Gundi")
-    response = await send_events_to_gundi(
+    if to_send:
+        logger.info(f"Submitting {len(to_send)} eBird observations to Gundi for integration ID: {str(integration.id)}")
+        await send_events_to_gundi(
             events=to_send,
-            integration_id=str(integration.id))
+            integration_id=str(integration.id)
+        )
+    else:
+        logger.info(f"No eBird observations to submit to Gundi for integration ID: {str(integration.id)}")
 
     return {'result': {'events_extracted': len(to_send)}}
 
