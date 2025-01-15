@@ -1,6 +1,13 @@
 from typing import Optional
+from enum import Enum
 import pydantic
 from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin
+
+
+class SearchParameter(Enum):
+    REGION = "region"
+    LAT_LON_DISTANCE = "lat-lon-distance"
+
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     api_key: pydantic.SecretStr = pydantic.Field(..., title = "eBird API Key", 
@@ -9,20 +16,35 @@ class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     
 class PullEventsConfig(PullActionConfiguration):
 
-    latitude: float = pydantic.Field(0, title="Latitude",
-        description="Latitude of point to search around.  If not present, a search region shoud be included instead.")
-    longitude: float = pydantic.Field(0, title="Longitude",
-        description="Longitude of point to search around.  If not present, a search region shoud be included instead.")
-    distance: float = pydantic.Field(25, title="Distance",
+    search_parameter: SearchParameter = pydantic.Field(
+        SearchParameter.LAT_LON_DISTANCE,
+        title="Search Parameter",
+        description="A parameter the integration will use for fetching events."
+    )
+    latitude: float = pydantic.Field(
+        None,
+        title="Latitude",
+        description="Latitude of point to search around. If not present, a search region should be included instead.",
+        ge=-90.0,
+        le=90.0
+    )
+    longitude: float = pydantic.Field(
+        None,
+        title="Longitude",
+        description="Longitude of point to search around. If not present, a search region should be included instead.",
+        ge=-180.0,
+        le=360.0
+    )
+    distance: float = pydantic.Field(None, title="Distance",
         description="Distance in kilometers to search around.  Max: 50km.  Default: 25km.", ge=1, le=50)
     
     num_days: int = pydantic.Field(2, title="Number of Days",
         description = "Number of days of data to pull from eBird.  Default: 2")
 
-    region_code: Optional[str] = pydantic.Field('', title="Region Code",
+    region_code: Optional[str] = pydantic.Field(None, title="Region Code",
         description="An eBird region code that should be used in the query.  Either a region code or a combination of latitude, longitude and distance should be included.")
     
-    species_code: Optional[str] = pydantic.Field('', title="Species Code",
+    species_code: Optional[str] = pydantic.Field(None, title="Species Code",
         description="An eBird species code that should be used in the query.  If not included, all species will be searched.")
 
     include_provisional: bool = pydantic.Field(False, title="Include Unreviewed", 
@@ -36,14 +58,55 @@ class PullEventsConfig(PullActionConfiguration):
         return v
 
     class Config:
-        schema_extra = {
-            "examples": [
-                {
-                    "latitude": 47.5218082,
-                    "longitude": -122.3864506,
-                    "distance": 30,
-                    "num_days": 1
+        @staticmethod
+        def schema_extra(schema: dict):
+            # Remove latitude, longitude, distance and region_code from the root properties
+            schema["properties"].pop("latitude", None)
+            schema["properties"].pop("longitude", None)
+            schema["properties"].pop("distance", None)
+            schema["properties"].pop("region_code", None)
+
+            # Show region_code OR latitude & longitude & distance based on search_parameter
+            schema.update({
+                "if": {
+                    "properties": {
+                        "search_parameter": {"const": "lat-lon-distance"}
+                    }
+                },
+                "then": {
+                    "required": ["latitude", "longitude", "distance"],
+                    "properties": {
+                        "latitude": {
+                            "type": "number",
+                            "title": "Latitude",
+                            "description": "Latitude of point to search around.",
+                            "minimum": -90.0,
+                            "maximum": 90.0
+                        },
+                        "longitude": {
+                            "type": "number",
+                            "title": "Longitude",
+                            "description": "Longitude of point to search around.",
+                            "minimum": -180.0,
+                            "maximum": 360.0
+                        },
+                        "distance": {
+                            "type": "number",
+                            "title": "Distance",
+                            "maximum": 50,
+                            "minimum": 1,
+                            "description": "Distance in kilometers to search around.  Max: 50km."
+                        },
+                    }
+                },
+                "else": {
+                    "required": ["region_code"],
+                    "properties": {
+                        "region_code": {
+                            "type": "string",
+                            "title": "Region Code",
+                            "description": "An eBird region code that should be used in the query."
+                        }
+                    }
                 }
-            ],
-            "required": ["latitude", "longitude", "distance", "num_days"]
-        }
+            })

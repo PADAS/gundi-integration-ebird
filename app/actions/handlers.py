@@ -88,24 +88,29 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
 
     base_url = integration.base_url or EBIRD_API
 
-    if(action_config.region_code):
-        if((action_config.latitude and action_config.latitude != 0) or
-           (action_config.longitude and action_config.longitude != 0)):
-            raise ConfigurationValidationError("If region code is included, latitude and longitude should be blank.")
-        
-        obs = _get_recent_observations_by_region(base_url, auth_config.api_key.get_secret_value(), action_config.num_days, 
-                                                 action_config.region_code, action_config.species_code,
-                                                 action_config.include_provisional)
-
+    # Check config based on search_parameter
+    if action_config.search_parameter.value == "region" :
+        if not action_config.region_code:
+            raise ConfigurationValidationError("Region code is required for 'region' search parameter.")
+        else:
+            obs = _get_recent_observations_by_region(
+                base_url, auth_config.api_key.get_secret_value(),
+                action_config.num_days,
+                action_config.region_code, action_config.species_code,
+                action_config.include_provisional
+            )
     else:
-        if((not action_config.latitude or action_config.latitude == 0) or
-           (not action_config.longitude or action_config.longitude == 0) or
-           (not action_config.distance or action_config.distance == 0)):
-            raise ConfigurationValidationError("Either a region code or a latitude and longitude should be included.")
-
-        obs = _get_recent_observations_by_location(base_url, auth_config.api_key.get_secret_value(), action_config.num_days,
-                                                   action_config.latitude, action_config.longitude, action_config.distance,
-                                                   action_config.include_provisional)
+        if not action_config.latitude or not action_config.longitude or not action_config.distance:
+            raise ConfigurationValidationError("Latitude, longitude, and distance are required for 'location' search parameter.")
+        else:
+            obs = _get_recent_observations_by_location(
+                base_url, auth_config.api_key.get_secret_value(),
+                action_config.num_days,
+                action_config.latitude,
+                action_config.longitude,
+                action_config.distance,
+                action_config.include_provisional
+            )
 
     to_send = []
     async for ob in obs:
