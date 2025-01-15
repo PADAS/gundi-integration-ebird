@@ -1,7 +1,7 @@
 import httpx
 import logging
 from datetime import datetime
-from app.actions.configurations import AuthenticateConfig, PullEventsConfig
+from app.actions.configurations import AuthenticateConfig, PullEventsConfig, SearchParameter
 from app.services.activity_logger import activity_logger
 from app.services.gundi import send_events_to_gundi
 from app.services.state import IntegrationStateManager
@@ -89,7 +89,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
     base_url = integration.base_url or EBIRD_API
 
     # Check config based on search_parameter
-    if action_config.search_parameter.value == "region" :
+    if action_config.search_parameter == SearchParameter.REGION :
         if not action_config.region_code:
             raise ConfigurationValidationError("Region code is required for 'region' search parameter.")
         else:
