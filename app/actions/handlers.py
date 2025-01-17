@@ -8,7 +8,7 @@ from app.services.state import IntegrationStateManager
 from app.services.errors import ConfigurationNotFound, ConfigurationValidationError
 from app.services.utils import find_config_for_action
 from gundi_core.schemas.v2 import Integration
-from pydantic import BaseModel, parse_obj_as
+from pydantic import BaseModel, parse_obj_as, validator
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,14 @@ class eBirdObservation(BaseModel):
     obsReviewed: bool
     locationPrivate: bool
     subId: str
+
+    @validator('obsDt', pre=True, always=True)
+    def clean_obsDt(cls, v):
+        # Parse the datetime string coming from eBird and return it in ISO format
+        parsed = datetime.fromisoformat(v)
+        v = parsed.isoformat()
+
+        return v
 
 async def handle_transformed_data(transformed_data, integration_id, action_id):
     try:
@@ -197,7 +205,7 @@ def _transform_ebird_to_gundi_event(obs: eBirdObservation):
     return {
         "title": f"{obs.comName} observation",
         "event_type": "ebird_observation",
-        "recorded_at": obs.obsDt.isoformat(),
+        "recorded_at": obs.obsDt,
         "location": {
             "lat": obs.lat,
             "lon": obs.lng
