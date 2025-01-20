@@ -2,7 +2,7 @@ from typing import Optional
 from enum import Enum
 import pydantic
 from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin
-from ..services.utils import GlobalUISchemaOptions
+from app.services.utils import GlobalUISchemaOptions
 
 
 class SearchParameter(Enum):
@@ -64,7 +64,17 @@ class PullEventsConfig(PullActionConfiguration):
         description="Language to use for species information. Default: EN (English)."
     )
     ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
-        order=["num_days", "species_code", "species_locale", "search_parameter", "include_provisional"],
+        order=[
+            "num_days",
+            "species_code",
+            "species_locale",
+            "search_parameter",
+            "distance",
+            "latitude",
+            "longitude",
+            "region_code",
+            "include_provisional"
+        ],
     )
     
     # Temporary validator to cope with a limitation in Gundi Portal.
