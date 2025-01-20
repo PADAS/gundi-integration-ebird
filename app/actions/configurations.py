@@ -2,11 +2,20 @@ from typing import Optional
 from enum import Enum
 import pydantic
 from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin
+from ..services.utils import GlobalUISchemaOptions
 
 
 class SearchParameter(Enum):
     REGION = "region"
     LAT_LON_DISTANCE = "lat-lon-distance"
+
+
+class SpeciesLocale(Enum):
+    EN = "en"
+    ES = "es"
+    FR = "fr"
+    PT = "pt_PT"
+    DE = "de"
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
@@ -49,6 +58,14 @@ class PullEventsConfig(PullActionConfiguration):
 
     include_provisional: bool = pydantic.Field(False, title="Include Unreviewed", 
         description="Whether or not to include observations that have not yet been reviewed.  Default: False.")
+    species_locale: SpeciesLocale = pydantic.Field(
+        SpeciesLocale.EN,
+        title="Species Locale",
+        description="Language to use for species information. Default: EN (English)."
+    )
+    ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
+        order=["num_days", "species_code", "species_locale", "search_parameter", "include_provisional"],
+    )
     
     # Temporary validator to cope with a limitation in Gundi Portal.
     @pydantic.validator("region_code", "species_code", always=True)
