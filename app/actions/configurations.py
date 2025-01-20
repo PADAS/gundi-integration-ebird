@@ -2,7 +2,7 @@ from typing import Optional
 from enum import Enum
 import pydantic
 from .core import PullActionConfiguration, AuthActionConfiguration, ExecutableActionMixin
-from app.services.utils import GlobalUISchemaOptions
+from app.services.utils import FieldWithUIOptions, GlobalUISchemaOptions, UIOptions
 
 
 class SearchParameter(Enum):
@@ -44,11 +44,27 @@ class PullEventsConfig(PullActionConfiguration):
         ge=-180.0,
         le=360.0
     )
-    distance: float = pydantic.Field(None, title="Distance",
-        description="Distance in kilometers to search around.  Max: 50km.  Default: 25km.", ge=1, le=50)
+    distance: float = FieldWithUIOptions(
+        None,
+        title="Distance",
+        description="Distance in kilometers to search around.  Max: 50km.  Default: 25km.",
+        ge=1,
+        le=50,
+        ui_options=UIOptions(
+            widget="range",  # This will be rendered ad a range slider
+        )
+    )
     
-    num_days: int = pydantic.Field(2, title="Number of Days",
-        description = "Number of days of data to pull from eBird.  Default: 2")
+    num_days: int = FieldWithUIOptions(
+        2,
+        title="Number of Days",
+        description = "Number of days of data to pull from eBird.  Default: 2. Min: 1, Max: 30.",
+        ge=1,
+        le=30,
+        ui_options = UIOptions(
+            widget="range",  # This will be rendered ad a range slider
+        )
+    )
 
     region_code: Optional[str] = pydantic.Field(None, title="Region Code",
         description="An eBird region code that should be used in the query.  Either a region code or a combination of latitude, longitude and distance should be included.")
