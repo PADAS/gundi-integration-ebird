@@ -105,7 +105,8 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 base_url, auth_config.api_key.get_secret_value(),
                 action_config.num_days,
                 action_config.region_code, action_config.species_code,
-                action_config.include_provisional
+                action_config.include_provisional,
+                species_locale=action_config.species_locale.value
             )
     else:
         if not action_config.latitude or not action_config.longitude or not action_config.distance:
@@ -117,7 +118,8 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 action_config.latitude,
                 action_config.longitude,
                 action_config.distance,
-                action_config.include_provisional
+                action_config.include_provisional,
+                species_locale=action_config.species_locale.value
             )
 
     to_send = []
@@ -146,11 +148,13 @@ async def _get_from_ebird(url: str, api_key: str, params: dict):
         return r.json()
 
 async def _get_recent_observations_by_region(base_url: str, api_key: str, num_days: int, region_code: str, 
-                                             species_code: str = None, include_provisional: bool = False):
+                                             species_code: str = None, include_provisional: bool = False,
+                                             species_locale: str = None):
 
         params = {
              "back": num_days,
-             "includeProvisional": include_provisional
+             "includeProvisional": include_provisional,
+            "sppLocale": species_locale
         }
         url = f"{base_url}/data/obs/{region_code}/recent"
         logger.info(f"Loading eBird observations for last {num_days} days near region code {region_code}.")
@@ -161,12 +165,13 @@ async def _get_recent_observations_by_region(base_url: str, api_key: str, num_da
 
 async def _get_recent_observations_by_location(base_url: str, api_key: str, num_days: int, lat: float, 
                                                lng: float, dist: float, species_code: str = None,
-                                               include_provisional: bool = False):
+                                               include_provisional: bool = False, species_locale: str = None):
 
         params = {
             "dist": dist,
             "back": num_days,
-            "includeProvisional": include_provisional
+            "includeProvisional": include_provisional,
+            "sppLocale": species_locale
         }
         url = f"{base_url}/data/obs/geo/recent?lat={lat}&lng={lng}"
 
