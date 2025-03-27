@@ -118,6 +118,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 action_config.latitude,
                 action_config.longitude,
                 action_config.distance,
+                action_config.species_code,
                 action_config.include_provisional,
                 species_locale=action_config.species_locale.value
             )
