@@ -214,7 +214,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
         logger.info(f"No eBird observations to submit to Gundi for integration ID: {str(integration.id)}")
 
     # Save latest_execution_time to state
-    state = {"latest_execution_time": datetime.now(tz=timezone.utc).timestamp()}
+    state = {"latest_execution_time": datetime.now(tz=timezone.utc).isoformat()}
     await state_manager.set_state(
         str(integration.id),
         "pull_events",
