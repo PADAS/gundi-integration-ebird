@@ -195,7 +195,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 logger.exception(msg, extra={
                     'needs_attention': True,
                     'integration_id': integration.id,
-                    'action_id': "pull_observations"
+                    'action_id': "pull_events"
                 })
                 raise e
             else:
