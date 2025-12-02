@@ -1,5 +1,6 @@
 import httpx
 import logging
+import math
 from datetime import datetime, timezone
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig, SearchParameter
 from app.services.action_scheduler import crontab_schedule
@@ -92,12 +93,13 @@ def get_auth_config(integration):
     return AuthenticateConfig.parse_obj(auth_config.data)
 
 async def filter_ebird_events(integration_id: str, events: List[dict]) -> List[dict]:
-    if saved_state := await state_manager.get_state(
+    saved_state = await state_manager.get_state(
         integration_id,
         "pull_events",
         "latest_observation_datetime"
-    ):
-        latest_observation_datetime = datetime.fromisoformat(saved_state.get("latest_observation_datetime")).replace(tzinfo=timezone.utc)
+    )
+    if saved_state:
+        latest_observation_datetime = datetime.fromisoformat(saved_state.get("latest_observation_datetime"))
         filtered_events = [
             event for event in events
             if event["recorded_at"] > latest_observation_datetime
@@ -118,11 +120,12 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
     base_url = integration.base_url or EBIRD_API
 
     # Check if latest_execution_time exists in state
-    if saved_latest_execution_time := await state_manager.get_state(
+    saved_latest_execution_time = await state_manager.get_state(
         str(integration.id),
         "pull_events",
         "latest_execution_time"
-    ):
+    )
+    if saved_latest_execution_time:
         latest_execution_time = saved_latest_execution_time.get("latest_execution_time")
         parsed_latest_execution_time = datetime.fromtimestamp(latest_execution_time, tz=timezone.utc)
 
@@ -131,7 +134,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
         # If it exists, adjust num_days to cover from that time to now
         now = datetime.now(tz=timezone.utc)
         delta = now - parsed_latest_execution_time
-        days_difference = delta.days if delta.total_seconds() >= SECONDS_IN_DAY else 1
+        days_difference = math.ceil(delta.total_seconds() / SECONDS_IN_DAY)
         lookback_days_to_fetch = days_difference
         logger.info(f"Adjusted num_days to {lookback_days_to_fetch} to cover from latest execution time to now for integration ID: {str(integration.id)}")
     else:
@@ -180,7 +183,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 action_id="pull_events"
             )
             latest_time = max(filtered_events_to_send, key=lambda obs: obs["recorded_at"])["recorded_at"]
-            state = {"latest_observation_datetime": latest_time}
+            state = {"latest_observation_datetime": latest_time.isoformat()}
             await state_manager.set_state(
                 str(integration.id),
                 "pull_events",

@@ -74,3 +74,29 @@ def test_transform_ebird_to_gundi_event_creates_expected_structure():
     assert details["valid"] is True
     assert details["reviewed"] is False
     assert details["submission_id"] == "S-1"
+
+
+def test_transform_preserves_timezone_aware_obsDt():
+    aware_dt = datetime(2023, 1, 1, 12, 0, tzinfo=timezone.utc)
+    obs = SimpleNamespace(
+        comName="Aware Bird",
+        sciName="Aware avium",
+        speciesCode="awr1",
+        locId="L777",
+        locName="Aware Park",
+        obsDt=aware_dt,
+        howMany=1,
+        lat=0.0,
+        lng=0.0,
+        obsValid=True,
+        obsReviewed=True,
+        locationPrivate=False,
+        subId="SUB",
+    )
+
+    event = handlers._transform_ebird_to_gundi_event(obs)
+    assert event["recorded_at"] == aware_dt
+    assert event["location"] == {"lat": 0.0, "lon": 0.0}
+    details = event["event_details"]
+    assert details["quantity"] == 1
+    assert details["submission_id"] == "SUB"
