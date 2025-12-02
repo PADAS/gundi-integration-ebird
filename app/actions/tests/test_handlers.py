@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import pytest
 
