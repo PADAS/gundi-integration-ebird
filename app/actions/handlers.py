@@ -10,7 +10,7 @@ from app.services.state import IntegrationStateManager
 from app.services.errors import ConfigurationNotFound, ConfigurationValidationError
 from app.services.utils import find_config_for_action
 from gundi_core.schemas.v2 import Integration
-from pydantic import BaseModel, parse_obj_as, validator, ValidationError
+from pydantic import BaseModel, parse_obj_as, validator
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -21,25 +21,51 @@ SECONDS_IN_DAY = 86400 # 24 hours * 60 minutes * 60 seconds
 
 
 class LatestObservationDatetimeState(BaseModel):
-    latest_observation_datetime: datetime
+    latest_observation_datetime: Optional[datetime] = None
 
-    @validator('latest_observation_datetime', pre=True, always=True)
+    @validator('latest_observation_datetime', pre=True)
     def clean_latest_observation_datetime(cls, v):
-        parsed = datetime.fromisoformat(v)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed
+        if v is None:
+            return None
+        elif isinstance(v, datetime):
+            if v.tzinfo is None:
+                return v.replace(tzinfo=timezone.utc)
+            return v.astimezone(timezone.utc)
+        else:
+            # Assuming v is a string
+            try:
+                parsed = datetime.fromisoformat(v)
+            except Exception:
+                # string is not in ISO format, return None
+                return None
+            else:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed
 
 
 class LatestExecutionDatetimeState(BaseModel):
-    latest_execution_time: datetime
+    latest_execution_time: Optional[datetime] = None
 
-    @validator('latest_execution_time', pre=True, always=True)
+    @validator('latest_execution_time', pre=True)
     def clean_latest_execution_time(cls, v):
-        parsed = datetime.fromisoformat(v)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed
+        if v is None:
+            return None
+        elif isinstance(v, datetime):
+            if v.tzinfo is None:
+                return v.replace(tzinfo=timezone.utc)
+            return v.astimezone(timezone.utc)
+        else:
+            # Assuming v is a string
+            try:
+                parsed = datetime.fromisoformat(v)
+            except Exception:
+                # string is not in ISO format, return None
+                return None
+            else:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed
 
 
 class eBirdObservation(BaseModel):
@@ -123,18 +149,16 @@ async def filter_ebird_events(integration_id: str, events: List[dict]) -> List[d
         "latest_observation_datetime"
     )
     if saved_state:
-        try:
-            state = LatestObservationDatetimeState.parse_obj(saved_state)
-        except ValidationError as e:
-            logger.error(f"Error parsing latest_observation_datetime state for integration ID: {integration_id}. Exception: {e}")
+        state = LatestObservationDatetimeState.parse_obj(saved_state)
+        if latest_observation_datetime := state.latest_observation_datetime:
+            filtered_events = [
+                event for event in events
+                if event["recorded_at"] > latest_observation_datetime
+            ]
+            logger.info(f"Filtered {len(events) - len(filtered_events)} eBird observations older than latest recorded observation datetime {latest_observation_datetime} for integration ID: {integration_id}")
+            return filtered_events
+        else:
             return events
-        latest_observation_datetime = state.latest_observation_datetime
-        filtered_events = [
-            event for event in events
-            if event["recorded_at"] > latest_observation_datetime
-        ]
-        logger.info(f"Filtered {len(events) - len(filtered_events)} eBird observations older than latest recorded observation datetime {latest_observation_datetime} for integration ID: {integration_id}")
-        return filtered_events
     else:
         return events
 
@@ -155,14 +179,8 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
         "latest_execution_time"
     )
     if saved_latest_execution_time:
-        try:
-            state = LatestExecutionDatetimeState.parse_obj(saved_latest_execution_time)
-        except ValidationError as e:
-            logger.error(f"Error parsing latest_execution_time state for integration ID: {str(integration.id)}. Exception: {e}")
-            lookback_days_to_fetch = action_config.num_days
-        else:
-            latest_execution_time = state.latest_execution_time
-
+        state = LatestExecutionDatetimeState.parse_obj(saved_latest_execution_time)
+        if latest_execution_time := state.latest_execution_time:
             logger.info(f"Latest execution time found in state: {latest_execution_time.isoformat()} for integration ID: {str(integration.id)}")
 
             # If it exists, adjust num_days to cover from that time to now
@@ -171,6 +189,8 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
             days_difference = math.ceil(delta.total_seconds() / SECONDS_IN_DAY)
             lookback_days_to_fetch = max(1, days_difference)
             logger.info(f"Adjusted num_days to {lookback_days_to_fetch} to cover from latest execution time to now for integration ID: {str(integration.id)}")
+        else:
+            lookback_days_to_fetch = action_config.num_days
     else:
         lookback_days_to_fetch = action_config.num_days
         logger.info(f"No latest execution time found in state. Using configured num_days: {lookback_days_to_fetch}.")
