@@ -17,12 +17,29 @@ logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 EBIRD_API = "https://api.ebird.org/v2"
-SECONDS_IN_DAY = 86400
+SECONDS_IN_DAY = 86400 # 24 hours * 60 minutes * 60 seconds
 
 
-class State(BaseModel):
-    latest_observation_datetime: Optional[datetime]
-    latest_execution_time: Optional[datetime]
+class LatestObservationDatetimeState(BaseModel):
+    latest_observation_datetime: datetime
+
+    @validator('latest_observation_datetime', pre=True, always=True)
+    def clean_latest_observation_datetime(cls, v):
+        parsed = datetime.fromisoformat(v)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+
+class LatestExecutionDatetimeState(BaseModel):
+    latest_execution_time: datetime
+
+    @validator('latest_execution_time', pre=True, always=True)
+    def clean_latest_execution_time(cls, v):
+        parsed = datetime.fromisoformat(v)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
 
 class eBirdObservation(BaseModel):
@@ -44,6 +61,8 @@ class eBirdObservation(BaseModel):
     def clean_obsDt(cls, v):
         # Parse the datetime string coming from eBird and return it in ISO format
         parsed = datetime.fromisoformat(v)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
         v = parsed.isoformat()
 
         return v
@@ -104,7 +123,7 @@ async def filter_ebird_events(integration_id: str, events: List[dict]) -> List[d
         "latest_observation_datetime"
     )
     if saved_state:
-        state = State.parse_obj(saved_state)
+        state = LatestObservationDatetimeState.parse_obj(saved_state)
         latest_observation_datetime = state.latest_observation_datetime
         filtered_events = [
             event for event in events
@@ -132,7 +151,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
         "latest_execution_time"
     )
     if saved_latest_execution_time:
-        state = State.parse_obj(saved_latest_execution_time)
+        state = LatestExecutionDatetimeState.parse_obj(saved_latest_execution_time)
         latest_execution_time = state.latest_execution_time
 
         logger.info(f"Latest execution time found in state: {latest_execution_time.isoformat()} for integration ID: {str(integration.id)}")
@@ -184,20 +203,15 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
         filtered_events = await filter_ebird_events(str(integration.id), transformed_events)
         if filtered_events:
             logger.info(f"Submitting {len(filtered_events)} eBird observations to Gundi for integration ID: {str(integration.id)}")
-            try:
-                await handle_transformed_data(
-                    transformed_data=filtered_events,
-                    integration_id=str(integration.id),
-                    action_id="pull_events"
-                )
-            except Exception as e:
-                msg = f'Sensors API returned error for integration_id: {str(integration.id)}. Exception: {e}'
-                logger.exception(msg, extra={
-                    'needs_attention': True,
-                    'integration_id': integration.id,
-                    'action_id': "pull_events"
-                })
-                raise e
+            response = await handle_transformed_data(
+                transformed_data=filtered_events,
+                integration_id=str(integration.id),
+                action_id="pull_events"
+            )
+            # check for error in response
+            if "error" in response:
+                logger.error(f"Error submitting eBird observations to Gundi for integration ID: {str(integration.id)}. Response: {response}")
+                events_extracted = 0
             else:
                 latest_time = max(filtered_events, key=lambda obs: obs["recorded_at"])["recorded_at"]
                 state = {"latest_observation_datetime": latest_time.isoformat()}
@@ -296,7 +310,7 @@ def _transform_ebird_to_gundi_event(obs: eBirdObservation):
     return {
         "title": f"{obs.comName} observation",
         "event_type": "ebird_observation",
-        "recorded_at": obs.obsDt.replace(tzinfo=timezone.utc),
+        "recorded_at": obs.obsDt,
         "location": {
             "lat": obs.lat,
             "lon": obs.lng
