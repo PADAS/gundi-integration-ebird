@@ -232,25 +232,20 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
         filtered_events = await filter_ebird_events(str(integration.id), transformed_events)
         if filtered_events:
             logger.info(f"Submitting {len(filtered_events)} eBird observations to Gundi for integration ID: {str(integration.id)}")
-            response = await handle_transformed_data(
+            await handle_transformed_data(
                 transformed_data=filtered_events,
                 integration_id=str(integration.id),
                 action_id="pull_events"
             )
-            # check for error in response
-            if "error" in response:
-                logger.error(f"Error submitting eBird observations to Gundi for integration ID: {str(integration.id)}. Response: {response}")
-                events_extracted = 0
-            else:
-                latest_time = max(filtered_events, key=lambda obs: obs["recorded_at"])["recorded_at"]
-                state = {"latest_observation_datetime": latest_time.isoformat()}
-                await state_manager.set_state(
-                    str(integration.id),
-                    "pull_events",
-                    state,
-                    "latest_observation_datetime"
-                )
-                events_extracted += len(filtered_events)
+            latest_time = max(filtered_events, key=lambda obs: obs["recorded_at"])["recorded_at"]
+            state = {"latest_observation_datetime": latest_time.isoformat()}
+            await state_manager.set_state(
+                str(integration.id),
+                "pull_events",
+                state,
+                "latest_observation_datetime"
+            )
+            events_extracted += len(filtered_events)
         else:
             logger.info(f"No new eBird observations to submit to Gundi after filtering for integration ID: {str(integration.id)}")
     else:
