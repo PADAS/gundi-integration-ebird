@@ -48,7 +48,7 @@ def test_transform_ebird_to_gundi_event_creates_expected_structure():
         speciesCode="tstbrd",
         locId="L123",
         locName="Test Park",
-        obsDt=datetime(2023, 1, 1, 12, 0, tzinfo=timezone.utc),  # naive datetime; transform should add UTC tz
+        obsDt=datetime(2023, 1, 1, 12, 0, tzinfo=timezone.utc),  # timezone-aware datetime (UTC)
         howMany=3,
         lat=12.34,
         lng=56.78,
