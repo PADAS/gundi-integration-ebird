@@ -21,7 +21,7 @@ SECONDS_IN_DAY = 86400 # 24 hours * 60 minutes * 60 seconds
 
 
 class State(BaseModel):
-    latest_observation_at: Optional[datetime] = None
+    latest_observation_at: Optional[datetime] = datetime.min.replace(tzinfo=timezone.utc)
 
     @validator('latest_observation_at')
     def ensure_timezone_aware(cls, v):
@@ -100,20 +100,6 @@ def get_auth_config(integration):
     return AuthenticateConfig.parse_obj(auth_config.data)
 
 
-def filter_ebird_events(integration_id: str, events: List[dict], lower_bound: Optional[datetime]) -> List[dict]:
-
-    if lower_bound:
-        filtered_events = [
-            event for event in events
-            if event["recorded_at"] > lower_bound
-        ]
-        filtered_events = list(filtered_events)
-    else:
-        filtered_events = events
-    logger.info(f"Filtered {len(events) - len(filtered_events)} eBird observations older than lower bound {lower_bound} for integration ID: {integration_id}")
-    return filtered_events
-
-
 async def get_or_create_state(integration_id: str, action_id: str):
     if saved_state := await state_manager.get_state(integration_id, action_id):
         try:
@@ -121,7 +107,7 @@ async def get_or_create_state(integration_id: str, action_id: str):
         except ValidationError as e:
             logger.error(f"Error parsing last execution time {saved_state} state for integration ID: {integration_id}. Exception: {e}")
 
-    return State(latest_observation_at=None)
+    return State(latest_observation_at=datetime.min.replace(tzinfo=timezone.utc))
 
 
 @crontab_schedule("0 * * * *") # Run every hour
@@ -169,26 +155,28 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 species_locale=action_config.species_locale.value
             )
 
-
-    transformed_events = []
+    # Filter and transform observations to Gundi events.
+    filtered_events = []
+    max_event_timestamp = state.latest_observation_at
     async for ob in obs:
-        transformed_events.append(_transform_ebird_to_gundi_event(ob))
+        if ob.obsDt > state.latest_observation_at:
+            filtered_events.append(_transform_ebird_to_gundi_event(ob))
+            max_event_timestamp = max(max_event_timestamp, ob.obsDt)
 
     events_extracted = 0
     
-    if filtered_events := filter_ebird_events(str(integration.id), transformed_events, state.latest_observation_at):        
+    if filtered_events:        
         logger.info(f"Submitting {len(filtered_events)} eBird observations to Gundi for integration ID: {str(integration.id)}")
         await handle_transformed_data(
             transformed_data=filtered_events,
             integration_id=str(integration.id),
             action_id="pull_events"
         )
-        max_event_timestamp = max(filtered_events, key=lambda obs: obs["recorded_at"])["recorded_at"]
 
         await state_manager.set_state(
             str(integration.id),
             "pull_events",
-            {'latest_observation_at': max_event_timestamp}
+            {"latest_observation_at": max_event_timestamp.isoformat()}
         )   
         events_extracted = len(filtered_events)
 
