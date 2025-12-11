@@ -52,27 +52,6 @@ class eBirdObservation(BaseModel):
         return v
 
 
-async def handle_transformed_data(transformed_data, integration_id, action_id):
-    try:
-        response = await send_events_to_gundi(
-            events=transformed_data,
-            integration_id=integration_id
-        )
-    except httpx.HTTPError as e:
-        msg = f'Sensors API returned error for integration_id: {integration_id}. Exception: {e}'
-        logger.exception(
-            msg,
-            extra={
-                'needs_attention': True,
-                'integration_id': integration_id,
-                'action_id': action_id
-            }
-        )
-        return [msg]
-    else:
-        return response
-
-
 async def action_auth(integration:Integration, action_config: AuthenticateConfig):
     logger.info(f"Executing auth action with integration {integration} and action_config {action_config}...")
 
@@ -167,10 +146,10 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
     
     if filtered_events:        
         logger.info(f"Submitting {len(filtered_events)} eBird observations to Gundi for integration ID: {str(integration.id)}")
-        await handle_transformed_data(
-            transformed_data=filtered_events,
-            integration_id=str(integration.id),
-            action_id="pull_events"
+
+        await send_events_to_gundi(
+            events=filtered_events,
+            integration_id=str(integration.id)
         )
 
         await state_manager.set_state(
