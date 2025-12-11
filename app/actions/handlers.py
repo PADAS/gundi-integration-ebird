@@ -20,25 +20,13 @@ EBIRD_API = "https://api.ebird.org/v2"
 SECONDS_IN_DAY = 86400 # 24 hours * 60 minutes * 60 seconds
 
 
-class LatestObservationDatetimeState(BaseModel):
-    latest_observation_datetime: Optional[datetime] = None
+class State(BaseModel):
+    latest_observation_at: Optional[datetime] = None
 
-    @validator('latest_observation_datetime', pre=True)
-    def clean_latest_observation_datetime(cls, v):
-        if isinstance(v, datetime):
-            if v.tzinfo is None:
-                return v.replace(tzinfo=timezone.utc)
-        return v
-
-
-class LatestExecutionDatetimeState(BaseModel):
-    latest_execution_time: Optional[datetime] = None
-
-    @validator('latest_execution_time', pre=True)
-    def clean_latest_execution_time(cls, v):
-        if isinstance(v, datetime):
-            if v.tzinfo is None:
-                return v.replace(tzinfo=timezone.utc)
+    @validator('latest_observation_at')
+    def ensure_timezone_aware(cls, v):
+        if v and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
         return v
 
 
@@ -57,15 +45,12 @@ class eBirdObservation(BaseModel):
     locationPrivate: bool
     subId: str
 
-    @validator('obsDt', pre=True, always=True)
+    @validator('obsDt')
     def clean_obsDt(cls, v):
-        # Parse the datetime string coming from eBird and return it in ISO format
-        parsed = datetime.fromisoformat(v)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        v = parsed.isoformat()
-
+        if v and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
         return v
+
 
 async def handle_transformed_data(transformed_data, integration_id, action_id):
     try:
@@ -88,7 +73,6 @@ async def handle_transformed_data(transformed_data, integration_id, action_id):
         return response
 
 
-
 async def action_auth(integration:Integration, action_config: AuthenticateConfig):
     logger.info(f"Executing auth action with integration {integration} and action_config {action_config}...")
 
@@ -100,7 +84,6 @@ async def action_auth(integration:Integration, action_config: AuthenticateConfig
         return {"valid_credentials": True}
     except httpx.HTTPStatusError as e:
         return {"valid_credentials": False, "status_code": e.response.status_code}
-
 
 
 def get_auth_config(integration):
@@ -116,28 +99,27 @@ def get_auth_config(integration):
         )
     return AuthenticateConfig.parse_obj(auth_config.data)
 
-async def filter_ebird_events(integration_id: str, events: List[dict]) -> List[dict]:
-    saved_state = await state_manager.get_state(
-        integration_id,
-        "pull_events",
-        "latest_observation_datetime"
-    )
-    if saved_state:
+
+def filter_ebird_events(integration_id: str, events: List[dict], lower_bound: Optional[datetime]) -> List[dict]:
+
+    filtered_events = [
+        event for event in events
+        if event["recorded_at"] > lower_bound
+    ]
+    filtered_events = list(filtered_events)
+    logger.info(f"Filtered {len(events) - len(filtered_events)} eBird observations older than lower bound {lower_bound} for integration ID: {integration_id}")
+    return filtered_events
+
+
+async def get_or_create_state(integration_id: str, action_id: str):
+    if saved_state := await state_manager.get_state(integration_id, action_id):
         try:
-            state = LatestObservationDatetimeState.parse_obj(saved_state)
+            return State.validate(saved_state)
         except ValidationError as e:
-            logger.error(
-                f"Error parsing last saved obs state {saved_state} for integration ID: {integration_id}. Exception: {e}")
-            return events
-        latest_observation_datetime = state.latest_observation_datetime
-        filtered_events = [
-            event for event in events
-            if event["recorded_at"] > latest_observation_datetime
-        ]
-        logger.info(f"Filtered {len(events) - len(filtered_events)} eBird observations older than latest recorded observation datetime {latest_observation_datetime} for integration ID: {integration_id}")
-        return filtered_events
-    else:
-        return events
+            logger.error(f"Error parsing last execution time {saved_state} state for integration ID: {integration_id}. Exception: {e}")
+
+    return State(latest_observation_at=None)
+
 
 @crontab_schedule("0 * * * *") # Run every hour
 @activity_logger()
@@ -150,31 +132,13 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
     base_url = integration.base_url or EBIRD_API
 
     # Check if latest_execution_time exists in state
-    saved_latest_execution_time = await state_manager.get_state(
-        str(integration.id),
-        "pull_events",
-        "latest_execution_time"
-    )
-    if saved_latest_execution_time:
-        try:
-            state = LatestExecutionDatetimeState.parse_obj(saved_latest_execution_time)
-        except ValidationError as e:
-            logger.error(f"Error parsing last execution time {saved_latest_execution_time} state for integration ID: {str(integration.id)}. Exception: {e}")
-            lookback_days_to_fetch = action_config.num_days
-        else:
-            latest_execution_time = state.latest_execution_time
-            logger.info(f"Latest execution time found in state: {latest_execution_time.isoformat()} for integration ID: {str(integration.id)}")
+    state = await get_or_create_state(str(integration.id), "pull_events")
 
-            # Adjust num_days to cover from that time to now
-            now = datetime.now(tz=timezone.utc)
-            delta = now - latest_execution_time
-            days_difference = math.ceil(delta.total_seconds() / SECONDS_IN_DAY)
-            lookback_days_to_fetch = max(1, days_difference)
-            logger.info(f"Adjusted num_days to {lookback_days_to_fetch} to cover from latest execution time to now for integration ID: {str(integration.id)}")
+    # Calculate number of days to query based on the latest observation time in state
+    if state.latest_observation_at:
+        lookback_days_to_fetch = min(action_config.num_days, math.ceil( (datetime.now(tz=timezone.utc) - state.latest_observation_at).total_seconds() / SECONDS_IN_DAY))
     else:
         lookback_days_to_fetch = action_config.num_days
-        logger.info(f"No latest execution time found in state. Using configured num_days: {lookback_days_to_fetch}.")
-
 
     # Check config based on search_parameter
     if action_config.search_parameter == SearchParameter.REGION :
@@ -203,42 +167,26 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 species_locale=action_config.species_locale.value
             )
 
-    transformed_events = []
+    transformed_events = [_transform_ebird_to_gundi_event(ob) for ob in obs]
     events_extracted = 0
-    async for ob in obs:
-        transformed_events.append(_transform_ebird_to_gundi_event(ob))
     
-    if transformed_events:
-        filtered_events = await filter_ebird_events(str(integration.id), transformed_events)
-        if filtered_events:
-            logger.info(f"Submitting {len(filtered_events)} eBird observations to Gundi for integration ID: {str(integration.id)}")
-            await handle_transformed_data(
-                transformed_data=filtered_events,
-                integration_id=str(integration.id),
-                action_id="pull_events"
-            )
-            latest_time = max(filtered_events, key=lambda obs: obs["recorded_at"])["recorded_at"]
-            state = {"latest_observation_datetime": latest_time.isoformat()}
-            await state_manager.set_state(
-                str(integration.id),
-                "pull_events",
-                state,
-                "latest_observation_datetime"
-            )
-            events_extracted += len(filtered_events)
-        else:
-            logger.info(f"No new eBird observations to submit to Gundi after filtering for integration ID: {str(integration.id)}")
-    else:
-        logger.info(f"No eBird observations to submit to Gundi for integration ID: {str(integration.id)}")
+    if filtered_events := filter_ebird_events(str(integration.id), transformed_events, state.latest_execution_time):
+        
+        logger.info(f"Submitting {len(filtered_events)} eBird observations to Gundi for integration ID: {str(integration.id)}")
+        await handle_transformed_data(
+            transformed_data=filtered_events,
+            integration_id=str(integration.id),
+            action_id="pull_events"
+        )
+        max_event_timestamp = max(filtered_events, key=lambda obs: obs["recorded_at"])["recorded_at"]
 
-    # Save latest_execution_time to state
-    state = {"latest_execution_time": datetime.now(tz=timezone.utc).isoformat()}
-    await state_manager.set_state(
-        str(integration.id),
-        "pull_events",
-        state,
-        "latest_execution_time"
-    )
+        await state_manager.set_state(
+            str(integration.id),
+            "pull_events",
+            {'latest_observation_at': max_event_timestamp}
+        )   
+        events_extracted = len(filtered_events)
+
     return {'result': {'events_extracted': events_extracted}}
 
 async def _get_from_ebird(url: str, api_key: str, params: dict):
@@ -314,7 +262,7 @@ def _transform_ebird_to_gundi_event(obs: eBirdObservation):
     return {
         "title": f"{obs.comName} observation",
         "event_type": "ebird_observation",
-        "recorded_at": obs.obsDt,
+        "recorded_at": obs.obsDt.isoformat(),
         "location": {
             "lat": obs.lat,
             "lon": obs.lng
