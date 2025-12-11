@@ -131,7 +131,6 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
 
     base_url = integration.base_url or EBIRD_API
 
-    # Check if latest_execution_time exists in state
     state = await get_or_create_state(str(integration.id), "pull_events")
 
     # Calculate number of days to query based on the latest observation time in state
@@ -167,11 +166,14 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 species_locale=action_config.species_locale.value
             )
 
-    transformed_events = [_transform_ebird_to_gundi_event(ob) for ob in obs]
+
+    transformed_events = []
+    async for ob in obs:
+        transformed_events.append(_transform_ebird_to_gundi_event(ob))
+
     events_extracted = 0
     
-    if filtered_events := filter_ebird_events(str(integration.id), transformed_events, state.latest_execution_time):
-        
+    if filtered_events := filter_ebird_events(str(integration.id), transformed_events, state.latest_observation_at):        
         logger.info(f"Submitting {len(filtered_events)} eBird observations to Gundi for integration ID: {str(integration.id)}")
         await handle_transformed_data(
             transformed_data=filtered_events,
