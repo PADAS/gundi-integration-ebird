@@ -1,20 +1,35 @@
 import httpx
 import logging
-from datetime import datetime
+import math
+from datetime import datetime, timezone
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig, SearchParameter
+from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger
 from app.services.gundi import send_events_to_gundi
 from app.services.state import IntegrationStateManager
 from app.services.errors import ConfigurationNotFound, ConfigurationValidationError
 from app.services.utils import find_config_for_action
 from gundi_core.schemas.v2 import Integration
-from pydantic import BaseModel, parse_obj_as, validator
+from pydantic import BaseModel, Field, parse_obj_as, validator, ValidationError
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 EBIRD_API = "https://api.ebird.org/v2"
+SECONDS_IN_DAY = 86400 # 24 hours * 60 minutes * 60 seconds
+
+
+class State(BaseModel):
+    latest_observation_at: datetime = Field(default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc))
+
+    @validator('latest_observation_at')
+    def ensure_timezone_aware(cls, v):
+        if v and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
+
+
 class eBirdObservation(BaseModel):
     speciesCode: str
     comName: str
@@ -30,34 +45,11 @@ class eBirdObservation(BaseModel):
     locationPrivate: bool
     subId: str
 
-    @validator('obsDt', pre=True, always=True)
+    @validator('obsDt')
     def clean_obsDt(cls, v):
-        # Parse the datetime string coming from eBird and return it in ISO format
-        parsed = datetime.fromisoformat(v)
-        v = parsed.isoformat()
-
+        if v and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
         return v
-
-async def handle_transformed_data(transformed_data, integration_id, action_id):
-    try:
-        response = await send_events_to_gundi(
-            events=transformed_data,
-            integration_id=integration_id
-        )
-    except httpx.HTTPError as e:
-        msg = f'Sensors API returned error for integration_id: {integration_id}. Exception: {e}'
-        logger.exception(
-            msg,
-            extra={
-                'needs_attention': True,
-                'integration_id': integration_id,
-                'action_id': action_id
-            }
-        )
-        return [msg]
-    else:
-        return response
-
 
 
 async def action_auth(integration:Integration, action_config: AuthenticateConfig):
@@ -73,7 +65,6 @@ async def action_auth(integration:Integration, action_config: AuthenticateConfig
         return {"valid_credentials": False, "status_code": e.response.status_code}
 
 
-
 def get_auth_config(integration):
     # Look for the login credentials, needed for any action
     auth_config = find_config_for_action(
@@ -87,6 +78,18 @@ def get_auth_config(integration):
         )
     return AuthenticateConfig.parse_obj(auth_config.data)
 
+
+async def get_or_create_state(integration_id: str, action_id: str):
+    if saved_state := await state_manager.get_state(integration_id, action_id):
+        try:
+            return State.validate(saved_state)
+        except ValidationError as e:
+            logger.error(f"Error parsing last execution time {saved_state} state for integration ID: {integration_id}. Exception: {e}")
+
+    return State(latest_observation_at=datetime.min.replace(tzinfo=timezone.utc))
+
+
+@crontab_schedule("0 * * * *") # Run every hour
 @activity_logger()
 async def action_pull_events(integration:Integration, action_config: PullEventsConfig):
 
@@ -96,6 +99,15 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
 
     base_url = integration.base_url or EBIRD_API
 
+    state = await get_or_create_state(str(integration.id), "pull_events")
+
+    # Calculate number of days to query based on the latest observation time in state
+    if state.latest_observation_at:
+        lookback_days_to_fetch = min(action_config.num_days, math.ceil( (datetime.now(tz=timezone.utc) - state.latest_observation_at).total_seconds() / SECONDS_IN_DAY))
+        lookback_days_to_fetch = max(1, lookback_days_to_fetch)
+    else:
+        lookback_days_to_fetch = action_config.num_days
+
     # Check config based on search_parameter
     if action_config.search_parameter == SearchParameter.REGION :
         if not action_config.region_code:
@@ -103,7 +115,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
         else:
             obs = _get_recent_observations_by_region(
                 base_url, auth_config.api_key.get_secret_value(),
-                action_config.num_days,
+                lookback_days_to_fetch,
                 action_config.region_code, action_config.species_code,
                 action_config.include_provisional,
                 species_locale=action_config.species_locale.value
@@ -114,7 +126,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
         else:
             obs = _get_recent_observations_by_location(
                 base_url, auth_config.api_key.get_secret_value(),
-                action_config.num_days,
+                lookback_days_to_fetch,
                 action_config.latitude,
                 action_config.longitude,
                 action_config.distance,
@@ -123,20 +135,32 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 species_locale=action_config.species_locale.value
             )
 
-    to_send = []
+    # Filter and transform observations to Gundi events.
+    filtered_events = []
+    max_event_timestamp = state.latest_observation_at
     async for ob in obs:
-        to_send.append(_transform_ebird_to_gundi_event(ob))
+        if ob.obsDt > state.latest_observation_at:
+            filtered_events.append(_transform_ebird_to_gundi_event(ob))
+            max_event_timestamp = max(max_event_timestamp, ob.obsDt)
+
+    events_extracted = 0
     
-    if to_send:
-        logger.info(f"Submitting {len(to_send)} eBird observations to Gundi for integration ID: {str(integration.id)}")
+    if filtered_events:        
+        logger.info(f"Submitting {len(filtered_events)} eBird observations to Gundi for integration ID: {str(integration.id)}")
+
         await send_events_to_gundi(
-            events=to_send,
+            events=filtered_events,
             integration_id=str(integration.id)
         )
-    else:
-        logger.info(f"No eBird observations to submit to Gundi for integration ID: {str(integration.id)}")
 
-    return {'result': {'events_extracted': len(to_send)}}
+        await state_manager.set_state(
+            str(integration.id),
+            "pull_events",
+            {"latest_observation_at": max_event_timestamp.isoformat()}
+        )   
+        events_extracted = len(filtered_events)
+
+    return {'result': {'events_extracted': events_extracted}}
 
 async def _get_from_ebird(url: str, api_key: str, params: dict):
     headers = {
@@ -211,7 +235,7 @@ def _transform_ebird_to_gundi_event(obs: eBirdObservation):
     return {
         "title": f"{obs.comName} observation",
         "event_type": "ebird_observation",
-        "recorded_at": obs.obsDt,
+        "recorded_at": obs.obsDt.isoformat(),
         "location": {
             "lat": obs.lat,
             "lon": obs.lng
