@@ -102,11 +102,14 @@ def get_auth_config(integration):
 
 def filter_ebird_events(integration_id: str, events: List[dict], lower_bound: Optional[datetime]) -> List[dict]:
 
-    filtered_events = [
-        event for event in events
-        if event["recorded_at"] > lower_bound
-    ]
-    filtered_events = list(filtered_events)
+    if lower_bound:
+        filtered_events = [
+            event for event in events
+            if event["recorded_at"] > lower_bound
+        ]
+        filtered_events = list(filtered_events)
+    else:
+        filtered_events = events
     logger.info(f"Filtered {len(events) - len(filtered_events)} eBird observations older than lower bound {lower_bound} for integration ID: {integration_id}")
     return filtered_events
 
