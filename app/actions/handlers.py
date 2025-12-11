@@ -10,7 +10,7 @@ from app.services.state import IntegrationStateManager
 from app.services.errors import ConfigurationNotFound, ConfigurationValidationError
 from app.services.utils import find_config_for_action
 from gundi_core.schemas.v2 import Integration
-from pydantic import BaseModel, parse_obj_as, validator, ValidationError
+from pydantic import BaseModel, Field, parse_obj_as, validator, ValidationError
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ SECONDS_IN_DAY = 86400 # 24 hours * 60 minutes * 60 seconds
 
 
 class State(BaseModel):
-    latest_observation_at: Optional[datetime] = datetime.min.replace(tzinfo=timezone.utc)
+    latest_observation_at: datetime = Field(default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc))
 
     @validator('latest_observation_at')
     def ensure_timezone_aware(cls, v):
@@ -104,6 +104,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
     # Calculate number of days to query based on the latest observation time in state
     if state.latest_observation_at:
         lookback_days_to_fetch = min(action_config.num_days, math.ceil( (datetime.now(tz=timezone.utc) - state.latest_observation_at).total_seconds() / SECONDS_IN_DAY))
+        lookback_days_to_fetch = max(1, lookback_days_to_fetch)
     else:
         lookback_days_to_fetch = action_config.num_days
 
