@@ -1,5 +1,11 @@
+import asyncio
 import pytest
-from app.services.gundi import send_events_to_gundi, send_observations_to_gundi, send_event_attachments_to_gundi
+from app.services.gundi import (
+    send_events_to_gundi,
+    send_observations_to_gundi,
+    send_event_attachments_to_gundi,
+    update_event_in_gundi,
+)
 
 
 @pytest.mark.asyncio
@@ -47,6 +53,39 @@ async def test_send_events_to_gundi(
     assert len(response) == 2
     assert mock_gundi_sensors_client_class.called
     mock_gundi_sensors_client_class.return_value.post_events.assert_called_once_with(data=events)
+
+
+@pytest.mark.asyncio
+async def test_update_event_in_gundi(
+        mocker, mock_gundi_client_v2_class, mock_gundi_sensors_client_class,
+        mock_get_gundi_api_key, integration_v2
+):
+    mocker.patch("app.services.gundi.GundiClient", mock_gundi_client_v2_class)
+    mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
+    mocker.patch("app.services.gundi._get_gundi_api_key", mock_get_gundi_api_key)
+    update_response = asyncio.Future()
+    update_response.set_result({"object_id": "dummy-1234", "updated": True})
+    mock_gundi_sensors_client_class.return_value.update_event.return_value = update_response
+    event = {
+        "title": "Animal Sighting",
+        "event_details": {
+            "species": "lion",
+            "quantity": 2
+        }
+    }
+
+    response = await update_event_in_gundi(
+        event_id="dummy-1234",
+        event=event,
+        integration_id=integration_v2.id
+    )
+
+    assert response == {"object_id": "dummy-1234", "updated": True}
+    assert mock_gundi_sensors_client_class.called
+    mock_gundi_sensors_client_class.return_value.update_event.assert_called_once_with(
+        event_id="dummy-1234",
+        data=event
+    )
 
 
 @pytest.mark.asyncio

@@ -40,7 +40,7 @@ class ObservationRecord(BaseModel):
 
 class State(BaseModel):
     latest_observation_at: datetime = Field(default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc))
-    observations: Dict[str, ObservationRecord] = {}
+    observations: Dict[str, ObservationRecord] = Field(default_factory=dict)
 
     @validator('latest_observation_at')
     def ensure_timezone_aware(cls, v):
@@ -315,7 +315,8 @@ def _parse_observation(ob: dict) -> Optional[eBirdObservation]:
     try:
         return parse_obj_as(eBirdObservation, ob)
     except ValidationError as e:
-        logger.warning(f"Skipping malformed eBird observation record {ob}: {e}")
+        record_ref = f"subId={ob.get('subId')} speciesCode={ob.get('speciesCode')} obsDt={ob.get('obsDt')}" if isinstance(ob, dict) else repr(type(ob))
+        logger.warning(f"Skipping malformed eBird observation record ({record_ref}): {e}")
         return None
 
 
