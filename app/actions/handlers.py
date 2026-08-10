@@ -45,6 +45,14 @@ class eBirdObservation(BaseModel):
     locationPrivate: bool
     subId: str
 
+    @validator('obsDt', pre=True)
+    def parse_date_only_obsDt(cls, v):
+        # eBird omits the time portion when a checklist has no start time
+        # (e.g. "2026-08-09" instead of "2026-08-09 14:32"); treat those as midnight.
+        if isinstance(v, str) and len(v.strip()) == 10:
+            return f"{v.strip()} 00:00"
+        return v
+
     @validator('obsDt')
     def clean_obsDt(cls, v):
         if v and v.tzinfo is None:
