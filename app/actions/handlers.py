@@ -1,33 +1,59 @@
+import hashlib
 import httpx
+import json
 import logging
-import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig, SearchParameter
 from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger
-from app.services.gundi import send_events_to_gundi
+from app.services.gundi import send_events_to_gundi, update_event_in_gundi
 from app.services.state import IntegrationStateManager
 from app.services.errors import ConfigurationNotFound, ConfigurationValidationError
 from app.services.utils import find_config_for_action
 from gundi_core.schemas.v2 import Integration
 from pydantic import BaseModel, Field, parse_obj_as, validator, ValidationError
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 EBIRD_API = "https://api.ebird.org/v2"
-SECONDS_IN_DAY = 86400 # 24 hours * 60 minutes * 60 seconds
+
+# Entries older than the fetch window can never reappear in an eBird response,
+# so they are pruned from state after this many extra days of margin.
+PRUNE_MARGIN_DAYS = 1
+
+
+class ObservationRecord(BaseModel):
+    # gundi_event_id is None for records seeded from legacy watermark state
+    # (sent before per-observation tracking existed) — those cannot be updated.
+    gundi_event_id: Optional[str] = None
+    fingerprint: str
+    obs_dt: datetime
+
+    @validator('obs_dt')
+    def ensure_timezone_aware(cls, v):
+        if v and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
 
 
 class State(BaseModel):
     latest_observation_at: datetime = Field(default_factory=lambda: datetime.min.replace(tzinfo=timezone.utc))
+    observations: Dict[str, ObservationRecord] = Field(default_factory=dict)
 
     @validator('latest_observation_at')
     def ensure_timezone_aware(cls, v):
         if v and v.tzinfo is None:
             return v.replace(tzinfo=timezone.utc)
         return v
+
+    @property
+    def is_legacy_format(self) -> bool:
+        # Legacy watermark-only state never carried an 'observations' key;
+        # an empty-but-present map is new-format state (e.g. fully pruned)
+        # and must not be mistaken for legacy.
+        return "observations" not in self.__fields_set__
 
 
 class eBirdObservation(BaseModel):
@@ -97,6 +123,16 @@ async def get_or_create_state(integration_id: str, action_id: str):
     return State(latest_observation_at=datetime.min.replace(tzinfo=timezone.utc))
 
 
+def _observation_key(obs: "eBirdObservation") -> str:
+    # A species appears at most once per checklist, so subId + speciesCode is a
+    # stable natural key for an observation across fetches and edits.
+    return f"{obs.subId}:{obs.speciesCode}"
+
+
+def _fingerprint_event(event: dict) -> str:
+    return hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
 @crontab_schedule("0 * * * *") # Run every hour
 @activity_logger()
 async def action_pull_events(integration:Integration, action_config: PullEventsConfig):
@@ -109,12 +145,10 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
 
     state = await get_or_create_state(str(integration.id), "pull_events")
 
-    # Calculate number of days to query based on the latest observation time in state
-    if state.latest_observation_at:
-        lookback_days_to_fetch = min(action_config.num_days, math.ceil( (datetime.now(tz=timezone.utc) - state.latest_observation_at).total_seconds() / SECONDS_IN_DAY))
-        lookback_days_to_fetch = max(1, lookback_days_to_fetch)
-    else:
-        lookback_days_to_fetch = action_config.num_days
+    # Always fetch the full configured window: eBird checklists are routinely
+    # submitted hours or days after the observation date, so shrinking the
+    # window based on the latest delivered observation hides late submissions.
+    lookback_days_to_fetch = action_config.num_days
 
     # Check config based on search_parameter
     if action_config.search_parameter == SearchParameter.REGION :
@@ -143,32 +177,77 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 species_locale=action_config.species_locale.value
             )
 
-    # Filter and transform observations to Gundi events.
-    filtered_events = []
-    max_event_timestamp = state.latest_observation_at
+    # Legacy state carries only the watermark: observations at or before it were
+    # already delivered by the old logic, so they are seeded into the keyed map
+    # without resending (with no Gundi ID, so they age out rather than update).
+    is_legacy_state = state.is_legacy_format and state.latest_observation_at > datetime.min.replace(tzinfo=timezone.utc)
+
+    new_events = []
+    new_keys = []
+    updates = []
     async for ob in obs:
-        if ob.obsDt > state.latest_observation_at:
-            filtered_events.append(_transform_ebird_to_gundi_event(ob))
-            max_event_timestamp = max(max_event_timestamp, ob.obsDt)
+        key = _observation_key(ob)
+        event = _transform_ebird_to_gundi_event(ob)
+        fingerprint = _fingerprint_event(event)
+        record = state.observations.get(key)
+        if record is None:
+            already_sent_by_legacy_logic = is_legacy_state and ob.obsDt <= state.latest_observation_at
+            state.observations[key] = ObservationRecord(fingerprint=fingerprint, obs_dt=ob.obsDt)
+            if not already_sent_by_legacy_logic:
+                new_events.append(event)
+                new_keys.append(key)
+        elif record.fingerprint != fingerprint:
+            record.fingerprint = fingerprint
+            record.obs_dt = ob.obsDt
+            if record.gundi_event_id:
+                updates.append((record.gundi_event_id, event))
+            else:
+                logger.warning(
+                    f"eBird observation {key} changed but has no Gundi event ID "
+                    f"(sent before per-observation tracking); the edit will not be delivered."
+                )
+        state.latest_observation_at = max(state.latest_observation_at, ob.obsDt)
 
     events_extracted = 0
-    
-    if filtered_events:        
-        logger.info(f"Submitting {len(filtered_events)} eBird observations to Gundi for integration ID: {str(integration.id)}")
-
-        await send_events_to_gundi(
-            events=filtered_events,
+    if new_events:
+        logger.info(f"Submitting {len(new_events)} eBird observations to Gundi for integration ID: {str(integration.id)}")
+        response = await send_events_to_gundi(
+            events=new_events,
             integration_id=str(integration.id)
         )
+        if isinstance(response, list) and len(response) == len(new_events):
+            for key, trace in zip(new_keys, response):
+                object_id = trace.get("object_id") if isinstance(trace, dict) else None
+                state.observations[key].gundi_event_id = str(object_id) if object_id else None
+        else:
+            logger.warning(
+                f"Unexpected response shape from send_events_to_gundi; "
+                f"updates will be unavailable for this batch of {len(new_events)} events."
+            )
+        events_extracted = len(new_events)
 
-        await state_manager.set_state(
-            str(integration.id),
-            "pull_events",
-            {"latest_observation_at": max_event_timestamp.isoformat()}
-        )   
-        events_extracted = len(filtered_events)
+    events_updated = 0
+    for event_id, event in updates:
+        logger.info(f"Updating previously sent event {event_id} in Gundi for integration ID: {str(integration.id)}")
+        await update_event_in_gundi(
+            event_id=event_id,
+            event=event,
+            integration_id=str(integration.id)
+        )
+        events_updated += 1
 
-    return {'result': {'events_extracted': events_extracted}}
+    # Entries older than the fetch window cannot reappear in a response, so
+    # dropping them keeps state size bounded.
+    prune_cutoff = datetime.now(tz=timezone.utc) - timedelta(days=action_config.num_days + PRUNE_MARGIN_DAYS)
+    state.observations = {key: record for key, record in state.observations.items() if record.obs_dt >= prune_cutoff}
+
+    await state_manager.set_state(
+        str(integration.id),
+        "pull_events",
+        json.loads(state.json())
+    )
+
+    return {'result': {'events_extracted': events_extracted, 'events_updated': events_updated}}
 
 async def _get_from_ebird(url: str, api_key: str, params: dict):
     headers = {
@@ -223,14 +302,29 @@ async def _get_recent_observations(base_url, api_key, params, species_code: str 
                 if obs:
                     logger.info(f"Loading observations for specie '{specie}'.")
                     for ob in obs:
-                        yield parse_obj_as(eBirdObservation, ob)
+                        parsed = _parse_observation(ob)
+                        if parsed:
+                            yield parsed
                 else:
                     logger.info(f"No observations found for specie '{specie}'.")
-        
+
         else:
             obs = await _get_from_ebird(base_url, api_key, params=params)
             for ob in obs:
-                yield parse_obj_as(eBirdObservation, ob)
+                parsed = _parse_observation(ob)
+                if parsed:
+                    yield parsed
+
+
+def _parse_observation(ob: dict) -> Optional[eBirdObservation]:
+    # One malformed record must not abort the whole pull and lose the valid
+    # observations fetched alongside it.
+    try:
+        return parse_obj_as(eBirdObservation, ob)
+    except ValidationError as e:
+        record_ref = f"subId={ob.get('subId')} speciesCode={ob.get('speciesCode')} obsDt={ob.get('obsDt')}" if isinstance(ob, dict) else repr(type(ob))
+        logger.warning(f"Skipping malformed eBird observation record ({record_ref}): {e}")
+        return None
 
 
 async def get_region_info(base_url: str, api_key: str, region_code: str):
