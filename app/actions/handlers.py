@@ -48,6 +48,13 @@ class State(BaseModel):
             return v.replace(tzinfo=timezone.utc)
         return v
 
+    @property
+    def is_legacy_format(self) -> bool:
+        # Legacy watermark-only state never carried an 'observations' key;
+        # an empty-but-present map is new-format state (e.g. fully pruned)
+        # and must not be mistaken for legacy.
+        return "observations" not in self.__fields_set__
+
 
 class eBirdObservation(BaseModel):
     speciesCode: str
@@ -173,7 +180,7 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
     # Legacy state carries only the watermark: observations at or before it were
     # already delivered by the old logic, so they are seeded into the keyed map
     # without resending (with no Gundi ID, so they age out rather than update).
-    is_legacy_state = not state.observations and state.latest_observation_at > datetime.min.replace(tzinfo=timezone.utc)
+    is_legacy_state = state.is_legacy_format and state.latest_observation_at > datetime.min.replace(tzinfo=timezone.utc)
 
     new_events = []
     new_keys = []

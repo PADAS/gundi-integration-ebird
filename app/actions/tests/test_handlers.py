@@ -237,6 +237,26 @@ async def test_legacy_watermark_state_seeds_without_resending(sync_mocks):
 
 
 @pytest.mark.asyncio
+async def test_empty_pruned_state_is_not_treated_as_legacy(sync_mocks):
+    # New-format state whose observation map emptied out (quiet region, or
+    # num_days raised after pruning) must not seed-skip like legacy state:
+    # a late submission older than the stored watermark must still be sent.
+    sync_mocks.get_state.return_value = {
+        "latest_observation_at": "2026-08-09T10:00:00+00:00",
+        "observations": {},
+    }
+    sync_mocks.ebird.return_value = [
+        _observation_payload(subId="S-LATE", speciesCode="sp1", obsDt="2026-08-08 09:00"),
+    ]
+
+    result = await handlers.action_pull_events(_make_integration(), _make_config())
+
+    assert result["result"]["events_extracted"] == 1
+    state = _saved_state(sync_mocks)
+    assert state["observations"]["S-LATE:sp1"]["gundi_event_id"] == "gid-0"
+
+
+@pytest.mark.asyncio
 async def test_malformed_record_is_skipped_without_aborting(sync_mocks):
     bad = _observation_payload(subId="S-BAD", speciesCode="sp1")
     del bad["lat"]
