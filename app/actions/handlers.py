@@ -2,6 +2,7 @@ import hashlib
 import httpx
 import json
 import logging
+import stamina
 from datetime import datetime, timedelta, timezone
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig, SearchParameter
 from app.services.action_scheduler import crontab_schedule
@@ -22,6 +23,28 @@ EBIRD_API = "https://api.ebird.org/v2"
 # Entries older than the fetch window can never reappear in an eBird response,
 # so they are pruned from state after this many extra days of margin.
 PRUNE_MARGIN_DAYS = 1
+
+# httpx defaults every phase to 5s, which eBird routinely overruns on a wide
+# query (num_days up to 30, dist up to 50km): the observed production failures
+# were read timeouts waiting for response headers, not connect failures. Only
+# the read budget needs to be generous.
+EBIRD_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
+
+# Both stops are spelled out: stamina combines `attempts` and `timeout` with
+# stop_any(), so its defaults (attempts=10 / timeout=45s) would cut the curve
+# below short. Waits are min(2 * 2**n + jitter, 30) for n = 0..2, i.e. 2-7,
+# 4-9 and 8-13s: at most ~29s of waiting across four attempts, and with the
+# 60s read budget a fully-hanging endpoint costs ~4:30 for one call. That is
+# inside MAX_ACTION_EXECUTION_TIME (540s) but not negligible, so a pull with
+# several species codes can still exhaust the action budget if eBird is down
+# outright -- which is the correct outcome, reported as a connectivity error.
+EBIRD_API_RETRY = dict(
+    attempts=4,
+    timeout=180.0,
+    wait_initial=2.0,
+    wait_jitter=5.0,
+    wait_max=30.0,
+)
 
 
 class ObservationRecord(BaseModel):
@@ -249,15 +272,43 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
 
     return {'result': {'events_extracted': events_extracted, 'events_updated': events_updated}}
 
+
+class TransientEbirdError(httpx.HTTPStatusError):
+    """A 429 or 5xx from eBird: worth retrying, unlike a 4xx.
+
+    Subclasses HTTPStatusError so it keeps carrying `.response`, which
+    `app.services.errors.classify_error` reads to report a rate limit or a
+    provider fault rather than a generic failure when the retries run out.
+    """
+
+
 async def _get_from_ebird(url: str, api_key: str, params: dict):
     headers = {
         "X-eBirdApiToken": api_key
     }
 
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url, params=params, headers = headers)
-        r.raise_for_status()
-        return r.json()
+    payload = None
+    # httpx.TransportError covers the read timeout these retries exist for, plus
+    # connect and protocol failures. A 4xx raises plain HTTPStatusError and is
+    # not retried: a bad API key or a malformed region code will not fix itself.
+    # retry_context (rather than the @stamina.retry decorator) reads the policy
+    # at call time, so tests can shorten the waits -- and it matches the idiom
+    # already used in app/services/webhooks.py.
+    async for attempt in stamina.retry_context(
+        on=(httpx.TransportError, TransientEbirdError), **EBIRD_API_RETRY
+    ):
+        with attempt:
+            async with httpx.AsyncClient(timeout=EBIRD_TIMEOUT) as client:
+                r = await client.get(url, params=params, headers = headers)
+                if r.status_code == 429 or r.status_code >= 500:
+                    raise TransientEbirdError(
+                        f"eBird returned {r.status_code} for {r.request.url}",
+                        request=r.request,
+                        response=r,
+                    )
+                r.raise_for_status()
+                payload = r.json()
+    return payload
 
 async def _get_recent_observations_by_region(base_url: str, api_key: str, num_days: int, region_code: str, 
                                              species_code: str = None, include_provisional: bool = False,

@@ -2,11 +2,13 @@ from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from app.actions import handlers
 from app.actions.configurations import PullEventsConfig, SearchParameter
 from app.actions.handlers import eBirdObservation
+from app.services.errors import classify_error
 
 
 # Fixture timestamps are relative to a single instant captured when this module
@@ -391,3 +393,134 @@ def test_transform_preserves_timezone_aware_obsDt():
     details = event["event_details"]
     assert details["quantity"] == 1
     assert details["submission_id"] == "SUB"
+
+
+# --- eBird request timeout and retry -----------------------------------------
+
+
+class _FakeAsyncClient:
+    """Stands in for httpx.AsyncClient, replaying a scripted list of outcomes.
+
+    Each entry is either an exception to raise or an httpx.Response to return.
+    Records the timeout it was constructed with so the test can assert it.
+    """
+
+    constructed_with = []
+    script = []
+    calls = 0
+
+    def __init__(self, *args, **kwargs):
+        type(self).constructed_with.append(kwargs.get("timeout"))
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def get(self, url, params=None, headers=None):
+        cls = type(self)
+        outcome = cls.script[cls.calls]
+        cls.calls += 1
+        request = httpx.Request("GET", url)
+        if isinstance(outcome, Exception):
+            # httpx attaches the request to transport errors it raises.
+            outcome.request = request
+            raise outcome
+        outcome.request = request
+        return outcome
+
+
+@pytest.fixture
+def ebird_http(monkeypatch):
+    """Patch httpx.AsyncClient inside handlers and make retry waits instant."""
+    _FakeAsyncClient.constructed_with = []
+    _FakeAsyncClient.script = []
+    _FakeAsyncClient.calls = 0
+    monkeypatch.setattr(handlers.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(
+        handlers,
+        "EBIRD_API_RETRY",
+        dict(handlers.EBIRD_API_RETRY, wait_initial=0.001, wait_jitter=0.0, wait_max=0.001),
+    )
+    return _FakeAsyncClient
+
+
+def _json_response(status_code=200, payload=None):
+    return httpx.Response(status_code, json=payload if payload is not None else [])
+
+
+@pytest.mark.asyncio
+async def test_ebird_client_is_built_with_an_explicit_timeout(ebird_http):
+    # Regression: httpx's 5s default read timeout was failing production pulls
+    # on wide queries. The read budget is the one that matters.
+    ebird_http.script = [_json_response(payload=[{"ok": True}])]
+
+    await handlers._get_from_ebird("https://x/obs", "key", params={})
+
+    timeout = ebird_http.constructed_with[0]
+    assert timeout is not None, "AsyncClient must not fall back to httpx's 5s default"
+    assert timeout.read == 60.0
+    assert timeout.connect == 10.0
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_is_retried_and_can_succeed(ebird_http):
+    ebird_http.script = [
+        httpx.ReadTimeout("timed out"),
+        httpx.ReadTimeout("timed out"),
+        _json_response(payload=[{"subId": "S-1"}]),
+    ]
+
+    result = await handlers._get_from_ebird("https://x/obs", "key", params={})
+
+    assert result == [{"subId": "S-1"}]
+    assert ebird_http.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_gives_up_after_the_configured_attempts(ebird_http):
+    ebird_http.script = [httpx.ReadTimeout("timed out")] * 10
+
+    with pytest.raises(httpx.ReadTimeout):
+        await handlers._get_from_ebird("https://x/obs", "key", params={})
+
+    assert ebird_http.calls == handlers.EBIRD_API_RETRY["attempts"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [429, 500, 502, 503])
+async def test_transient_statuses_are_retried(ebird_http, status_code):
+    ebird_http.script = [_json_response(status_code), _json_response(payload=[{"ok": True}])]
+
+    result = await handlers._get_from_ebird("https://x/obs", "key", params={})
+
+    assert result == [{"ok": True}]
+    assert ebird_http.calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404])
+async def test_client_errors_are_not_retried(ebird_http, status_code):
+    # A bad API key or malformed region code will not fix itself; failing fast
+    # keeps a clear error in the portal instead of a delayed generic one.
+    ebird_http.script = [_json_response(status_code)] * 5
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await handlers._get_from_ebird("https://x/obs", "key", params={})
+
+    assert ebird_http.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_exhausted_transient_error_still_classifies_with_its_status(ebird_http):
+    # TransientEbirdError subclasses HTTPStatusError so classify_error can
+    # still read .response.status_code once the retries run out.
+    ebird_http.script = [_json_response(429)] * 10
+
+    with pytest.raises(handlers.TransientEbirdError) as exc_info:
+        await handlers._get_from_ebird("https://x/obs", "key", params={})
+
+    classified = classify_error(exc_info.value)
+    assert classified.error_type == "rate_limit"
+    assert classified.status_code == 429
