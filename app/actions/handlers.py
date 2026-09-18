@@ -330,13 +330,24 @@ async def _get_recent_observations_by_location(base_url: str, api_key: str, num_
                                                lng: float, dist: float, species_code: str = None,
                                                include_provisional: bool = False, species_locale: str = None):
 
+        # lat/lng belong in params, not baked into the URL. _get_recent_observations
+        # appends /{speciesCode} to whatever it is handed, so a URL carrying its own
+        # query string produced ".../geo/recent?lat=1.5&lng=2.5/amecro" -- the species
+        # code landing inside the lng value. eBird's endpoint is
+        # /data/obs/geo/recent/{speciesCode} with lat and lng as query parameters.
+        #
+        # Keeping them here also survives the httpx upgrade: 0.24 merges `params`
+        # into a URL's existing query string, but 0.28 replaces it outright, which
+        # would silently drop lat and lng from every geo request.
         params = {
+            "lat": lat,
+            "lng": lng,
             "dist": dist,
             "back": num_days,
             "includeProvisional": include_provisional,
             "sppLocale": species_locale
         }
-        url = f"{base_url}/data/obs/geo/recent?lat={lat}&lng={lng}"
+        url = f"{base_url}/data/obs/geo/recent"
 
         logger.info(f"Loading eBird observations for last {num_days} days near ({lat}, {lng}).")
         async for item in _get_recent_observations(url, api_key, params, species_code):
