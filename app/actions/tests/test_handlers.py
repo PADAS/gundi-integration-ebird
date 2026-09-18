@@ -9,6 +9,55 @@ from app.actions.configurations import PullEventsConfig, SearchParameter
 from app.actions.handlers import eBirdObservation
 
 
+# Fixture timestamps are relative to a single instant captured when this module
+# is imported: fixed for the whole run, so an observation built twice in one
+# test fingerprints identically, but never anchored to a calendar date.
+#
+# They were absolute dates until this module rotted. action_pull_events prunes
+# state entries older than num_days + PRUNE_MARGIN_DAYS, so once the hardcoded
+# 2026-08-09 fixtures aged past that window the handler stripped every
+# observation out of state before set_state, and the tests covering keyed-state
+# dedup began failing with KeyError on assertions that had quietly stopped
+# describing anything real.
+_NOW = datetime.now(tz=timezone.utc)
+
+# Fixture offsets, in hours before _NOW. Named so the ordering each test
+# depends on (newer vs. older than a watermark) survives a careless edit.
+_NEWER = 9
+_RECENT = 10
+_OLDER = 11
+_YESTERDAY = 34
+_TWO_DAYS_AGO = 58
+
+# Every fixture must land inside the prune window that _make_config's num_days
+# implies, or its test stops exercising the state assertions it was written for.
+_MAX_FIXTURE_HOURS_AGO = _TWO_DAYS_AGO
+
+
+def _within_prune_window(hours_ago: int) -> int:
+    assert hours_ago <= _MAX_FIXTURE_HOURS_AGO, (
+        f"fixture {hours_ago}h old exceeds the window this module guarantees "
+        f"({_MAX_FIXTURE_HOURS_AGO}h); raise _MAX_FIXTURE_HOURS_AGO and the "
+        f"num_days in _make_config together, or the handler will prune it"
+    )
+    return hours_ago
+
+
+def _obs_dt(hours_ago: int = _RECENT) -> str:
+    """An obsDt in eBird's "YYYY-MM-DD HH:MM" form, relative to _NOW."""
+    return (_NOW - timedelta(hours=_within_prune_window(hours_ago))).strftime("%Y-%m-%d %H:%M")
+
+
+def _obs_date_only(hours_ago: int = _RECENT) -> str:
+    """An obsDt with no time portion, as eBird sends when a checklist has no start time."""
+    return (_NOW - timedelta(hours=_within_prune_window(hours_ago))).strftime("%Y-%m-%d")
+
+
+def _watermark(hours_ago: int) -> str:
+    """A stored `latest_observation_at`, in the ISO form state round-trips through."""
+    return (_NOW - timedelta(hours=_within_prune_window(hours_ago))).isoformat()
+
+
 def _observation_payload(**overrides):
     payload = {
         "speciesCode": "tstbrd",
@@ -16,7 +65,7 @@ def _observation_payload(**overrides):
         "sciName": "Avium testus",
         "locId": "L123",
         "locName": "Test Park",
-        "obsDt": "2026-08-09 14:32",
+        "obsDt": _obs_dt(),
         "howMany": 3,
         "lat": 12.34,
         "lng": 56.78,
@@ -86,12 +135,23 @@ def _make_integration():
     )
 
 
-def _make_config(num_days=5):
+_DEFAULT_NUM_DAYS = 5
+
+
+def _make_config(num_days=_DEFAULT_NUM_DAYS):
     return PullEventsConfig(
         search_parameter=SearchParameter.REGION,
         region_code="US-CA",
         num_days=num_days,
     )
+
+
+def test_fixtures_stay_inside_the_handlers_prune_window():
+    # The invariant that keeps this module from rotting again: every fixture
+    # timestamp must survive the prune step in action_pull_events, or the state
+    # assertions in the tests below silently stop describing anything.
+    prune_window = timedelta(days=_DEFAULT_NUM_DAYS + handlers.PRUNE_MARGIN_DAYS)
+    assert timedelta(hours=_MAX_FIXTURE_HOURS_AGO) < prune_window
 
 
 @pytest.fixture
@@ -121,8 +181,8 @@ def _saved_state(mocks):
 @pytest.mark.asyncio
 async def test_new_observations_are_sent_and_recorded(sync_mocks):
     sync_mocks.ebird.return_value = [
-        _observation_payload(subId="S-1", speciesCode="sp1", obsDt="2026-08-09 10:00"),
-        _observation_payload(subId="S-1", speciesCode="sp2", obsDt="2026-08-09 11:00"),
+        _observation_payload(subId="S-1", speciesCode="sp1", obsDt=_obs_dt(_RECENT)),
+        _observation_payload(subId="S-1", speciesCode="sp2", obsDt=_obs_dt(_NEWER)),
     ]
 
     result = await handlers.action_pull_events(_make_integration(), _make_config())
@@ -137,7 +197,7 @@ async def test_new_observations_are_sent_and_recorded(sync_mocks):
 
 @pytest.mark.asyncio
 async def test_unchanged_observations_are_not_resent(sync_mocks):
-    obs = _observation_payload(subId="S-1", speciesCode="sp1", obsDt="2026-08-09 10:00")
+    obs = _observation_payload(subId="S-1", speciesCode="sp1", obsDt=_obs_dt(_RECENT))
     sync_mocks.ebird.return_value = [obs]
     await handlers.action_pull_events(_make_integration(), _make_config())
     first_state = _saved_state(sync_mocks)
@@ -153,7 +213,7 @@ async def test_unchanged_observations_are_not_resent(sync_mocks):
 
 @pytest.mark.asyncio
 async def test_edited_observation_updates_existing_event(sync_mocks):
-    original = _observation_payload(subId="S-1", speciesCode="sp1", obsDt="2026-08-09 10:00", howMany=3)
+    original = _observation_payload(subId="S-1", speciesCode="sp1", obsDt=_obs_dt(_RECENT), howMany=3)
     sync_mocks.ebird.return_value = [original]
     await handlers.action_pull_events(_make_integration(), _make_config())
     first_state = _saved_state(sync_mocks)
@@ -177,14 +237,14 @@ async def test_late_submitted_observation_is_delivered(sync_mocks):
     # First run sees a recent observation; second run surfaces a checklist
     # observed EARLIER but submitted late — the old watermark logic dropped it.
     sync_mocks.ebird.return_value = [
-        _observation_payload(subId="S-1", speciesCode="sp1", obsDt="2026-08-09 10:00"),
+        _observation_payload(subId="S-1", speciesCode="sp1", obsDt=_obs_dt(_RECENT)),
     ]
     await handlers.action_pull_events(_make_integration(), _make_config())
     first_state = _saved_state(sync_mocks)
 
     sync_mocks.ebird.return_value = [
-        _observation_payload(subId="S-1", speciesCode="sp1", obsDt="2026-08-09 10:00"),
-        _observation_payload(subId="S-2", speciesCode="sp1", obsDt="2026-08-07 09:00"),
+        _observation_payload(subId="S-1", speciesCode="sp1", obsDt=_obs_dt(_RECENT)),
+        _observation_payload(subId="S-2", speciesCode="sp1", obsDt=_obs_dt(_TWO_DAYS_AGO)),
     ]
     sync_mocks.get_state.return_value = first_state
     sync_mocks.send.reset_mock()
@@ -198,14 +258,14 @@ async def test_late_submitted_observation_is_delivered(sync_mocks):
 @pytest.mark.asyncio
 async def test_date_only_observation_is_delivered(sync_mocks):
     sync_mocks.ebird.return_value = [
-        _observation_payload(subId="S-1", speciesCode="sp1", obsDt="2026-08-09 10:00"),
+        _observation_payload(subId="S-1", speciesCode="sp1", obsDt=_obs_dt(_RECENT)),
     ]
     await handlers.action_pull_events(_make_integration(), _make_config())
     first_state = _saved_state(sync_mocks)
 
     sync_mocks.ebird.return_value = [
-        _observation_payload(subId="S-1", speciesCode="sp1", obsDt="2026-08-09 10:00"),
-        _observation_payload(subId="S-3", speciesCode="sp1", obsDt="2026-08-09"),
+        _observation_payload(subId="S-1", speciesCode="sp1", obsDt=_obs_dt(_RECENT)),
+        _observation_payload(subId="S-3", speciesCode="sp1", obsDt=_obs_date_only(_RECENT)),
     ]
     sync_mocks.get_state.return_value = first_state
     sync_mocks.send.reset_mock()
@@ -220,10 +280,10 @@ async def test_date_only_observation_is_delivered(sync_mocks):
 async def test_legacy_watermark_state_seeds_without_resending(sync_mocks):
     # Old-format state (watermark only). Observations at/before the watermark were
     # already sent by the old logic — record them without resending; newer ones send.
-    sync_mocks.get_state.return_value = {"latest_observation_at": "2026-08-09T10:00:00+00:00"}
+    sync_mocks.get_state.return_value = {"latest_observation_at": _watermark(_RECENT)}
     sync_mocks.ebird.return_value = [
-        _observation_payload(subId="S-OLD", speciesCode="sp1", obsDt="2026-08-09 09:00"),
-        _observation_payload(subId="S-NEW", speciesCode="sp1", obsDt="2026-08-09 11:00"),
+        _observation_payload(subId="S-OLD", speciesCode="sp1", obsDt=_obs_dt(_OLDER)),
+        _observation_payload(subId="S-NEW", speciesCode="sp1", obsDt=_obs_dt(_NEWER)),
     ]
 
     result = await handlers.action_pull_events(_make_integration(), _make_config())
@@ -242,11 +302,11 @@ async def test_empty_pruned_state_is_not_treated_as_legacy(sync_mocks):
     # num_days raised after pruning) must not seed-skip like legacy state:
     # a late submission older than the stored watermark must still be sent.
     sync_mocks.get_state.return_value = {
-        "latest_observation_at": "2026-08-09T10:00:00+00:00",
+        "latest_observation_at": _watermark(_RECENT),
         "observations": {},
     }
     sync_mocks.ebird.return_value = [
-        _observation_payload(subId="S-LATE", speciesCode="sp1", obsDt="2026-08-08 09:00"),
+        _observation_payload(subId="S-LATE", speciesCode="sp1", obsDt=_obs_dt(_YESTERDAY)),
     ]
 
     result = await handlers.action_pull_events(_make_integration(), _make_config())
@@ -262,7 +322,7 @@ async def test_malformed_record_is_skipped_without_aborting(sync_mocks):
     del bad["lat"]
     sync_mocks.ebird.return_value = [
         bad,
-        _observation_payload(subId="S-GOOD", speciesCode="sp1", obsDt="2026-08-09 10:00"),
+        _observation_payload(subId="S-GOOD", speciesCode="sp1", obsDt=_obs_dt(_RECENT)),
     ]
 
     result = await handlers.action_pull_events(_make_integration(), _make_config())
@@ -276,13 +336,13 @@ async def test_malformed_record_is_skipped_without_aborting(sync_mocks):
 async def test_stale_state_entries_are_pruned(sync_mocks):
     stale_dt = (datetime.now(tz=timezone.utc) - timedelta(days=40)).isoformat()
     sync_mocks.get_state.return_value = {
-        "latest_observation_at": "2026-08-09T10:00:00+00:00",
+        "latest_observation_at": _watermark(_RECENT),
         "observations": {
             "S-STALE:sp1": {"gundi_event_id": "gid-old", "fingerprint": "x", "obs_dt": stale_dt},
         },
     }
     sync_mocks.ebird.return_value = [
-        _observation_payload(subId="S-1", speciesCode="sp1", obsDt="2026-08-09 11:00"),
+        _observation_payload(subId="S-1", speciesCode="sp1", obsDt=_obs_dt(_NEWER)),
     ]
 
     await handlers.action_pull_events(_make_integration(), _make_config())
