@@ -175,6 +175,8 @@ async def test_send_observations_to_gundi(
     (send_observations_to_gundi, {"observations": [], "integration_id": "id"}),
     (send_event_attachments_to_gundi, {"event_id": "e", "attachments": [], "integration_id": "id"}),
     (send_messages_to_gundi, {"messages": [], "integration_id": "id"}),
+    # This connector adds a sixth write helper on top of the template's five.
+    (update_event_in_gundi, {"event_id": "e", "event": {}, "integration_id": "id"}),
     (_get_gundi_api_key, {"integration_id": "id"}),
 ])
 @pytest.mark.asyncio
@@ -183,11 +185,20 @@ async def test_gundi_helpers_block_on_ephemeral_run(fn_and_args):
     # able to move data through Gundi (design invariant: reference actions
     # are read-only). Each entry point checks the contextvar and raises
     # before doing any I/O.
+    #
+    # The message must name the helper that was called. Every write helper
+    # reaches _get_gundi_api_key, whose own guard raises the same exception,
+    # so asserting only the type passes even for a helper that has lost its
+    # guard entirely -- the outer check is what stops the call before any I/O.
     fn, args = fn_and_args
     token = ephemeral_run.set(True)
     try:
-        with pytest.raises(EphemeralWriteBlocked):
+        with pytest.raises(EphemeralWriteBlocked) as exc_info:
             await fn(**args)
+        assert fn.__name__ in str(exc_info.value), (
+            f"{fn.__name__} was blocked by another helper's guard, not its own: "
+            f"{exc_info.value}"
+        )
     finally:
         ephemeral_run.reset(token)
 
@@ -255,7 +266,8 @@ def test_api_key_lookup_is_not_retried_on_its_own():
     the inner attempts on every outer one, so a failing portal would cost up to
     36 calls instead of 6 and blow the loop-overhead bound the tests above pin."""
     assert not hasattr(_get_gundi_api_key, "__wrapped__")
-    for helper in (send_events_to_gundi, send_observations_to_gundi, send_event_attachments_to_gundi, send_messages_to_gundi):
+    for helper in (send_events_to_gundi, send_observations_to_gundi, send_event_attachments_to_gundi,
+                   send_messages_to_gundi, update_event_in_gundi):
         assert hasattr(helper, "__wrapped__"), helper.__name__
 
 

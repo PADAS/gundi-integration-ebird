@@ -155,3 +155,50 @@ async def test_registration_does_not_retry_a_rejected_registration(no_backoff, m
         await self_registration.register_integration_in_gundi(gundi_client=client, type_slug="acme_tracker")
 
     assert client.register_integration_type.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_update_event_retries_a_transient_gundi_api_error(
+        no_backoff, mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key,
+):
+    """This connector's own write helper, through the real GUNDI_API_RETRY.
+
+    update_event_in_gundi carried `on=httpx.HTTPError` until the 3.7 upgrade.
+    GundiAPIError does not subclass httpx.HTTPError, so keeping that decorator
+    through the sync would have left the helper retrying nothing at all, with
+    the suite still green -- exactly the trap this module was written for.
+    """
+    from app.services.gundi import update_event_in_gundi
+
+    mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
+    mocker.patch("app.services.gundi._get_gundi_api_key", mock_get_gundi_api_key)
+    sensors = mock_gundi_sensors_client_class.return_value
+    sensors.update_event = AsyncMock(side_effect=[GundiAPIError(status_code=503), {"updated": True}])
+
+    result = await update_event_in_gundi(
+        event_id="gid-1", event={"title": "x"}, integration_id="abc-123"
+    )
+
+    assert result == {"updated": True}
+    assert sensors.update_event.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_update_event_does_not_retry_a_client_error(
+        no_backoff, mocker, mock_gundi_sensors_client_class, mock_get_gundi_api_key,
+):
+    # A 404 means the event is gone from Gundi: retrying cannot bring it back,
+    # and eBird pulls update events that may legitimately have been deleted.
+    from app.services.gundi import update_event_in_gundi
+
+    mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
+    mocker.patch("app.services.gundi._get_gundi_api_key", mock_get_gundi_api_key)
+    sensors = mock_gundi_sensors_client_class.return_value
+    sensors.update_event = AsyncMock(side_effect=GundiAPIError(status_code=404, detail="not found"))
+
+    with pytest.raises(GundiAPIError):
+        await update_event_in_gundi(
+            event_id="gid-1", event={"title": "x"}, integration_id="abc-123"
+        )
+
+    assert sensors.update_event.await_count == 1
