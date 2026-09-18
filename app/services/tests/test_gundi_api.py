@@ -12,7 +12,9 @@ from app.services.gundi import (
     send_messages_to_gundi,
     _get_gundi_api_key,
     EphemeralWriteBlocked,
+    GundiEventNotFound,
 )
+from gundi_client_v2.errors import GundiAPIError
 from app.services.activity_logger import ephemeral_run
 
 
@@ -320,3 +322,46 @@ async def test_webhook_integration_lookup_does_not_add_its_own_retry_loop(mocker
     assert integration is None
     assert lookup.await_count == 1
     assert isinstance(publish.call_args.kwargs["event"], IntegrationWebhookFailed)
+
+
+# --- update_event_in_gundi: which 404 is "the event is gone" -----------------
+
+
+@pytest.mark.asyncio
+async def test_update_event_maps_a_patch_404_to_event_not_found(
+        mocker, mock_gundi_sensors_client_class,
+):
+    """Only the event PATCH itself answering 404 means the event no longer
+    exists; the connector's handler clears its stored id on that signal."""
+    mocker.patch("app.services.gundi._get_gundi_api_key", AsyncMock(return_value="api-key"))
+    mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
+    mock_gundi_sensors_client_class.return_value.update_event = AsyncMock(
+        side_effect=GundiAPIError(status_code=404, detail="Not found.")
+    )
+
+    with pytest.raises(GundiEventNotFound) as exc_info:
+        await update_event_in_gundi(event_id="ev-1", event={"title": "x"}, integration_id="int-1")
+
+    assert exc_info.value.event_id == "ev-1"
+    assert exc_info.value.status_code == 404
+    assert isinstance(exc_info.value, GundiAPIError), "stays classifiable and non-retryable as a Gundi 404"
+
+
+@pytest.mark.asyncio
+async def test_update_event_keeps_a_prerequisite_404_distinct(
+        mocker, mock_gundi_sensors_client_class,
+):
+    """A 404 from the integration / API-key lookup is a portal-side problem, not
+    a deleted event, and must not surface as GundiEventNotFound."""
+    mocker.patch(
+        "app.services.gundi._get_gundi_api_key",
+        AsyncMock(side_effect=GundiAPIError(status_code=404, detail="Integration not found.")),
+    )
+    mocker.patch("app.services.gundi.GundiDataSenderClient", mock_gundi_sensors_client_class)
+
+    with pytest.raises(GundiAPIError) as exc_info:
+        await update_event_in_gundi(event_id="ev-1", event={"title": "x"}, integration_id="int-1")
+
+    assert not isinstance(exc_info.value, GundiEventNotFound)
+    assert exc_info.value.status_code == 404
+    mock_gundi_sensors_client_class.return_value.update_event.assert_not_called()
