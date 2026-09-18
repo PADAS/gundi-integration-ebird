@@ -408,6 +408,7 @@ class _FakeAsyncClient:
     constructed_with = []
     script = []
     calls = 0
+    requested_urls = []
 
     def __init__(self, *args, **kwargs):
         type(self).constructed_with.append(kwargs.get("timeout"))
@@ -422,7 +423,11 @@ class _FakeAsyncClient:
         cls = type(self)
         outcome = cls.script[cls.calls]
         cls.calls += 1
-        request = httpx.Request("GET", url)
+        # Built the way httpx builds it, so requested_urls reflects what actually
+        # goes on the wire -- including how this httpx version reconciles `params`
+        # with a query string already present in `url`.
+        request = httpx.Request("GET", url, params=params)
+        cls.requested_urls.append(str(request.url))
         if isinstance(outcome, Exception):
             # httpx attaches the request to transport errors it raises.
             outcome.request = request
@@ -437,6 +442,7 @@ def ebird_http(monkeypatch):
     _FakeAsyncClient.constructed_with = []
     _FakeAsyncClient.script = []
     _FakeAsyncClient.calls = 0
+    _FakeAsyncClient.requested_urls = []
     monkeypatch.setattr(handlers.httpx, "AsyncClient", _FakeAsyncClient)
     monkeypatch.setattr(
         handlers,
@@ -524,3 +530,102 @@ async def test_exhausted_transient_error_still_classifies_with_its_status(ebird_
     classified = classify_error(exc_info.value)
     assert classified.error_type == "rate_limit"
     assert classified.status_code == 429
+
+
+# --- endpoint construction ----------------------------------------------------
+
+
+async def _collect(agen):
+    return [item async for item in agen]
+
+
+@pytest.fixture
+def ebird_calls(monkeypatch):
+    """Record the (url, params) each fetch helper hands to _get_from_ebird."""
+    calls = []
+
+    async def fake_get(url, api_key, params=None):
+        calls.append((url, params))
+        return []
+
+    monkeypatch.setattr(handlers, "_get_from_ebird", fake_get)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_location_endpoint_puts_lat_lng_in_params(ebird_calls):
+    # Regression: lat/lng were baked into the URL as a query string. That left
+    # the species-code path appending to a URL that already had a query, and it
+    # breaks outright on httpx 0.28, which replaces a URL's query with `params`
+    # instead of merging into it.
+    await _collect(handlers._get_recent_observations_by_location(
+        handlers.EBIRD_API, "key", 5, lat=1.5, lng=2.5, dist=25,
+    ))
+
+    url, params = ebird_calls[0]
+    assert url == f"{handlers.EBIRD_API}/data/obs/geo/recent"
+    assert "?" not in url
+    assert params["lat"] == 1.5
+    assert params["lng"] == 2.5
+    assert params["dist"] == 25
+    assert params["back"] == 5
+
+
+@pytest.mark.asyncio
+async def test_location_endpoint_with_species_code_appends_a_path_segment(ebird_calls):
+    # eBird's endpoint is /data/obs/geo/recent/{speciesCode}?lat=&lng=. The old
+    # construction produced ".../geo/recent?lat=1.5&lng=2.5/amecro", putting the
+    # species code inside the lng value.
+    await _collect(handlers._get_recent_observations_by_location(
+        handlers.EBIRD_API, "key", 5, lat=1.5, lng=2.5, dist=25, species_code="amecro",
+    ))
+
+    url, params = ebird_calls[0]
+    assert url == f"{handlers.EBIRD_API}/data/obs/geo/recent/amecro"
+    assert params["lat"] == 1.5
+    assert params["lng"] == 2.5
+
+
+@pytest.mark.asyncio
+async def test_location_endpoint_fetches_each_species_code(ebird_calls):
+    await _collect(handlers._get_recent_observations_by_location(
+        handlers.EBIRD_API, "key", 5, lat=1.5, lng=2.5, dist=25, species_code="amecro,bkcchi",
+    ))
+
+    assert [url for url, _ in ebird_calls] == [
+        f"{handlers.EBIRD_API}/data/obs/geo/recent/amecro",
+        f"{handlers.EBIRD_API}/data/obs/geo/recent/bkcchi",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_region_endpoint_is_unchanged(ebird_calls):
+    # The region path was always correct -- it has no query string of its own.
+    # Pinned so the location fix cannot regress it.
+    await _collect(handlers._get_recent_observations_by_region(
+        handlers.EBIRD_API, "key", 5, "US-CA",
+    ))
+    await _collect(handlers._get_recent_observations_by_region(
+        handlers.EBIRD_API, "key", 5, "US-CA", species_code="amecro",
+    ))
+
+    assert [url for url, _ in ebird_calls] == [
+        f"{handlers.EBIRD_API}/data/obs/US-CA/recent",
+        f"{handlers.EBIRD_API}/data/obs/US-CA/recent/amecro",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_lat_lng_survive_onto_the_wire(ebird_http):
+    # The assertion that would have caught the httpx 0.28 query-handling change:
+    # exercise the real _get_from_ebird and inspect the URL httpx actually built.
+    ebird_http.script = [_json_response(payload=[])]
+
+    await _collect(handlers._get_recent_observations_by_location(
+        handlers.EBIRD_API, "key", 5, lat=1.5, lng=2.5, dist=25, species_code="amecro",
+    ))
+
+    sent = ebird_http.requested_urls[0]
+    assert sent.startswith(f"{handlers.EBIRD_API}/data/obs/geo/recent/amecro?")
+    assert "lat=1.5" in sent
+    assert "lng=2.5" in sent
