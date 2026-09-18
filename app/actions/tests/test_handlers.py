@@ -518,6 +518,65 @@ async def test_progress_is_checkpointed_before_the_action_timeout_can_cancel_the
     # ...while the edit that never completed is left for the next run.
     assert state["observations"]["S-2:sp1"] == first_state["observations"]["S-2:sp1"]
 
+
+def _just_outside_prune_window() -> str:
+    """A stored obs_dt one hour past the cutoff action_pull_events prunes at."""
+    return (_NOW - timedelta(days=_DEFAULT_NUM_DAYS + handlers.PRUNE_MARGIN_DAYS, hours=1)).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_pending_update_survives_checkpoint_pruning(sync_mocks):
+    # A record's stored obs_dt stays old until its PATCH lands. If the
+    # observation's date was corrected from outside the retention window to a
+    # recent one, the checkpoint after the POST would prune the pending record;
+    # the loop then KeyErrors on it and, worse, the pruning is already saved, so
+    # the next run POSTs the observation again as new.
+    sync_mocks.get_state.return_value = {
+        "latest_observation_at": _watermark(_RECENT),
+        "observations": {
+            "S-OLD:sp1": {"gundi_event_id": "gid-old", "fingerprint": "stale", "obs_dt": _just_outside_prune_window()},
+        },
+    }
+    sync_mocks.ebird.return_value = [
+        _observation_payload(subId="S-OLD", speciesCode="sp1", obsDt=_obs_dt(_RECENT)),
+        _observation_payload(subId="S-NEW", speciesCode="sp1", obsDt=_obs_dt(_NEWER)),
+    ]
+
+    result = await handlers.action_pull_events(_make_integration(), _make_config())
+
+    assert result["result"] == {"events_extracted": 1, "events_updated": 1}
+    sync_mocks.update.assert_awaited_once()
+    assert sync_mocks.update.await_args.kwargs["event_id"] == "gid-old"
+    state = _saved_state(sync_mocks)
+    assert state["observations"]["S-OLD:sp1"]["gundi_event_id"] == "gid-old"
+    assert state["observations"]["S-OLD:sp1"]["fingerprint"] != "stale"
+    assert "S-NEW:sp1" in state["observations"]
+
+
+@pytest.mark.asyncio
+async def test_record_with_a_failed_update_is_not_pruned(sync_mocks):
+    # The failed edit is left untouched so the next run retries it. That only
+    # works if the final prune does not drop the record for its old stored
+    # obs_dt -- otherwise the next run sees the observation as new and POSTs a
+    # duplicate instead of PATCHing.
+    sync_mocks.get_state.return_value = {
+        "latest_observation_at": _watermark(_RECENT),
+        "observations": {
+            "S-OLD:sp1": {"gundi_event_id": "gid-old", "fingerprint": "stale", "obs_dt": _just_outside_prune_window()},
+        },
+    }
+    sync_mocks.ebird.return_value = [
+        _observation_payload(subId="S-OLD", speciesCode="sp1", obsDt=_obs_dt(_RECENT)),
+    ]
+    sync_mocks.update.side_effect = GundiAPIError(status_code=503, detail="Unavailable")
+
+    with pytest.raises(GundiAPIError):
+        await handlers.action_pull_events(_make_integration(), _make_config())
+
+    state = _saved_state(sync_mocks)
+    assert state["observations"]["S-OLD:sp1"]["gundi_event_id"] == "gid-old"
+    assert state["observations"]["S-OLD:sp1"]["fingerprint"] == "stale"
+
 # --- eBird request timeout and retry -----------------------------------------
 
 

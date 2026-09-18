@@ -256,11 +256,21 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 f"updates will be unavailable for this batch of {len(new_events)} events."
             )
         events_extracted = len(new_events)
+
+    # Records whose edit has not been delivered yet keep their old obs_dt, and
+    # that date may already be outside the retention window if the observation
+    # was re-dated. They must not be pruned at a checkpoint (the loop would
+    # KeyError and the next run would POST a duplicate) nor at the final save
+    # when the update failed (the next run retries the edit only if the record
+    # is still there). Keys leave this set as their edit is applied.
+    pending_update_keys = {key for key, *_ in updates}
+
+    if new_events:
         # Checkpoint: the runner cancels the handler at MAX_ACTION_EXECUTION_TIME
         # and cancellation bypasses every `except Exception` below, so the ids
         # just recorded must be durable before the update loop can spend that
         # budget -- or the next run re-sends these events as new.
-        await _save_state(integration, action_config, state)
+        await _save_state(integration, action_config, state, keep=pending_update_keys)
 
     events_updated = 0
     update_failures = []
@@ -297,11 +307,12 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
             events_updated += 1
         record.fingerprint = fingerprint
         record.obs_dt = obs_dt
+        pending_update_keys.discard(key)
         # Checkpoint each delivered (or written-off) edit for the same reason:
         # a cancellation mid-batch must not undo the PATCHes that landed.
-        await _save_state(integration, action_config, state)
+        await _save_state(integration, action_config, state, keep=pending_update_keys)
 
-    await _save_state(integration, action_config, state)
+    await _save_state(integration, action_config, state, keep=pending_update_keys)
 
     if update_failures:
         # Reported only now: state is saved, so the events POSTed this run are
@@ -311,11 +322,16 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
     return {'result': {'events_extracted': events_extracted, 'events_updated': events_updated}}
 
 
-async def _save_state(integration: Integration, action_config: PullEventsConfig, state: State) -> None:
+async def _save_state(integration: Integration, action_config: PullEventsConfig, state: State, keep: set) -> None:
     # Entries older than the fetch window cannot reappear in a response, so
-    # dropping them keeps state size bounded.
+    # dropping them keeps state size bounded. `keep` holds the keys whose edit
+    # is still pending or failed this run: their stored obs_dt is stale by
+    # definition and must not decide their fate.
     prune_cutoff = datetime.now(tz=timezone.utc) - timedelta(days=action_config.num_days + PRUNE_MARGIN_DAYS)
-    state.observations = {key: record for key, record in state.observations.items() if record.obs_dt >= prune_cutoff}
+    state.observations = {
+        key: record for key, record in state.observations.items()
+        if key in keep or record.obs_dt >= prune_cutoff
+    }
 
     await state_manager.set_state(
         str(integration.id),
