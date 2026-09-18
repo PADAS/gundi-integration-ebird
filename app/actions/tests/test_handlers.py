@@ -9,6 +9,7 @@ from app.actions import handlers
 from app.actions.configurations import PullEventsConfig, SearchParameter
 from app.actions.handlers import eBirdObservation
 from app.services.errors import classify_error
+from gundi_client_v2.errors import GundiAPIError
 
 
 # Fixture timestamps are relative to a single instant captured when this module
@@ -336,7 +337,7 @@ async def test_malformed_record_is_skipped_without_aborting(sync_mocks):
 
 @pytest.mark.asyncio
 async def test_stale_state_entries_are_pruned(sync_mocks):
-    stale_dt = (datetime.now(tz=timezone.utc) - timedelta(days=40)).isoformat()
+    stale_dt = (_NOW - timedelta(days=40)).isoformat()
     sync_mocks.get_state.return_value = {
         "latest_observation_at": _watermark(_RECENT),
         "observations": {
@@ -394,6 +395,75 @@ def test_transform_preserves_timezone_aware_obsDt():
     assert details["quantity"] == 1
     assert details["submission_id"] == "SUB"
 
+
+
+# --- update failures ----------------------------------------------------------
+
+
+async def _two_observations_sent(sync_mocks):
+    """Run once with two observations so both have Gundi event ids in state."""
+    a = _observation_payload(subId="S-1", speciesCode="sp1", obsDt=_obs_dt(_RECENT), howMany=1)
+    b = _observation_payload(subId="S-2", speciesCode="sp1", obsDt=_obs_dt(_RECENT), howMany=1)
+    sync_mocks.ebird.return_value = [a, b]
+    await handlers.action_pull_events(_make_integration(), _make_config())
+    first_state = _saved_state(sync_mocks)
+    assert first_state["observations"]["S-1:sp1"]["gundi_event_id"] == "gid-0"
+    assert first_state["observations"]["S-2:sp1"]["gundi_event_id"] == "gid-1"
+    sync_mocks.get_state.return_value = first_state
+    sync_mocks.send.reset_mock()
+    sync_mocks.set_state.reset_mock()
+    return a, b, first_state
+
+
+@pytest.mark.asyncio
+async def test_update_for_an_event_deleted_in_gundi_does_not_abort_the_run(sync_mocks):
+    # A 404 is deliberately not retried by the Gundi helpers: the event is gone
+    # and will not come back. The run must still finish (state saved, the other
+    # edits delivered) and the record must stop carrying an id that will 404 on
+    # every future edit.
+    a, b, first_state = await _two_observations_sent(sync_mocks)
+    sync_mocks.ebird.return_value = [dict(a, howMany=5), dict(b, howMany=5)]
+    sync_mocks.update.side_effect = [GundiAPIError(status_code=404, detail="Not found"), {}]
+
+    result = await handlers.action_pull_events(_make_integration(), _make_config())
+
+    assert sync_mocks.update.await_count == 2, "the second edit must still be attempted"
+    assert result["result"]["events_updated"] == 1
+    assert sync_mocks.send.await_count == 0, "an edited observation is never re-sent as new"
+    state = _saved_state(sync_mocks)
+    gone = state["observations"]["S-1:sp1"]
+    assert gone["gundi_event_id"] is None
+    assert gone["fingerprint"] != first_state["observations"]["S-1:sp1"]["fingerprint"], (
+        "the edit is acknowledged as undeliverable, like a legacy record, not retried forever"
+    )
+    assert state["observations"]["S-2:sp1"]["gundi_event_id"] == "gid-1"
+
+
+@pytest.mark.asyncio
+async def test_failed_update_is_reported_only_after_state_is_saved(sync_mocks):
+    # Anything but a 404 (here a 503 that outlived the helper's retries) is a
+    # real failure and must surface as one. But raising before set_state would
+    # lose the ids of events POSTed earlier in the same run, so the next run
+    # would send them again. Save first, keep the failed edit retryable, then
+    # report the failure.
+    a, b, first_state = await _two_observations_sent(sync_mocks)
+    c = _observation_payload(subId="S-3", speciesCode="sp1", obsDt=_obs_dt(_NEWER), howMany=1)
+    sync_mocks.ebird.return_value = [dict(a, howMany=5), dict(b, howMany=5), c]
+    sync_mocks.update.side_effect = [GundiAPIError(status_code=503, detail="Unavailable"), {}]
+
+    with pytest.raises(GundiAPIError):
+        await handlers.action_pull_events(_make_integration(), _make_config())
+
+    assert sync_mocks.update.await_count == 2, "the second edit must still be attempted"
+    state = _saved_state(sync_mocks)
+    # The new observation POSTed in this run is recorded, so it is not duplicated.
+    assert state["observations"]["S-3:sp1"]["gundi_event_id"] == "gid-0"
+    # The failed edit is left exactly as it was, so the next run sees the
+    # fingerprint change again and retries the update.
+    assert state["observations"]["S-1:sp1"] == first_state["observations"]["S-1:sp1"]
+    # The successful edit is applied.
+    assert state["observations"]["S-2:sp1"]["fingerprint"] != first_state["observations"]["S-2:sp1"]["fingerprint"]
+    assert state["observations"]["S-2:sp1"]["gundi_event_id"] == "gid-1"
 
 # --- eBird request timeout and retry -----------------------------------------
 
@@ -531,6 +601,42 @@ async def test_exhausted_transient_error_still_classifies_with_its_status(ebird_
     assert classified.error_type == "rate_limit"
     assert classified.status_code == 429
 
+
+
+def _worst_case_waits(policy: dict) -> list:
+    """The sleeps tenacity performs between attempts when every jitter draw is
+    maximal: min(initial * 2**n + jitter, max) for n = 0 .. attempts-2."""
+    return [
+        min(policy["wait_initial"] * 2 ** n + policy["wait_jitter"], policy["wait_max"])
+        for n in range(policy["attempts"] - 1)
+    ]
+
+
+def test_ebird_retry_deadline_leaves_every_declared_attempt_reachable():
+    # stamina combines `attempts` and `timeout` with stop_any() and tenacity
+    # checks the deadline after each failed attempt, so the last declared
+    # attempt only runs if the earlier ones, at their httpx bound, plus the
+    # waits between them fit inside `timeout`. The retry tests above run with
+    # instant fakes and cannot see this; the first cut of this policy declared
+    # four attempts but a 180s deadline that a third 60s read timeout exhausted.
+    from app import settings
+
+    policy = handlers.EBIRD_API_RETRY
+    t = handlers.EBIRD_TIMEOUT
+    # A failing attempt can spend up to each phase's budget before the read
+    # times out; pool wait is excluded because a fresh client has a free pool.
+    attempt_bound = t.connect + t.write + t.read
+    waits = _worst_case_waits(policy)
+
+    elapsed_before_last_attempt = (policy["attempts"] - 1) * attempt_bound + sum(waits[:-1])
+    assert elapsed_before_last_attempt < policy["timeout"], (
+        f"{policy['attempts'] - 1} hanging attempts plus waits take {elapsed_before_last_attempt}s, "
+        f"past the {policy['timeout']}s deadline: attempt {policy['attempts']} can never run"
+    )
+    # And the whole curve still leaves room in the action budget for the other
+    # species codes in a pull.
+    worst_case_call = elapsed_before_last_attempt + waits[-1] + attempt_bound
+    assert worst_case_call < settings.MAX_ACTION_EXECUTION_TIME
 
 # --- endpoint construction ----------------------------------------------------
 

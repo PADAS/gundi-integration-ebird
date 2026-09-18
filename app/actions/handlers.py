@@ -9,7 +9,7 @@ from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger
 from app.services.gundi import send_events_to_gundi, update_event_in_gundi
 from app.services.state import IntegrationStateManager
-from app.services.errors import ConfigurationNotFound, ConfigurationValidationError
+from app.services.errors import ConfigurationNotFound, ConfigurationValidationError, source_status_code
 from app.services.utils import find_config_for_action
 from gundi_core.schemas.v2 import Integration
 from pydantic import BaseModel, Field, parse_obj_as, validator, ValidationError
@@ -33,14 +33,19 @@ EBIRD_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
 # Both stops are spelled out: stamina combines `attempts` and `timeout` with
 # stop_any(), so its defaults (attempts=10 / timeout=45s) would cut the curve
 # below short. Waits are min(2 * 2**n + jitter, 30) for n = 0..2, i.e. 2-7,
-# 4-9 and 8-13s: at most ~29s of waiting across four attempts, and with the
-# 60s read budget a fully-hanging endpoint costs ~4:30 for one call. That is
-# inside MAX_ACTION_EXECUTION_TIME (540s) but not negligible, so a pull with
-# several species codes can still exhaust the action budget if eBird is down
-# outright -- which is the correct outcome, reported as a connectivity error.
+# 4-9 and 8-13s. tenacity checks the deadline after each failed attempt, so
+# the deadline has to cover the attempts before the last one at their httpx
+# bound (connect + write + read = 80s each) plus the waits between them:
+# 3 * 80 + 16 = 256s, hence 270 rather than the 180 this first shipped with,
+# which a third read timeout exhausted, leaving the fourth attempt unreachable.
+# A fully-hanging endpoint then costs up to ~350s for one call. That is inside
+# MAX_ACTION_EXECUTION_TIME (540s) but not negligible, so a pull with several
+# species codes can still exhaust the action budget if eBird is down outright
+# -- which is the correct outcome, reported as a connectivity error.
+# test_ebird_retry_deadline_leaves_every_declared_attempt_reachable pins this.
 EBIRD_API_RETRY = dict(
     attempts=4,
-    timeout=180.0,
+    timeout=270.0,
     wait_initial=2.0,
     wait_jitter=5.0,
     wait_max=30.0,
@@ -220,11 +225,14 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 new_events.append(event)
                 new_keys.append(key)
         elif record.fingerprint != fingerprint:
-            record.fingerprint = fingerprint
-            record.obs_dt = ob.obsDt
             if record.gundi_event_id:
-                updates.append((record.gundi_event_id, event))
+                # The record is brought up to date only once the edit is
+                # delivered (or known to be undeliverable), so a failed PATCH
+                # shows up as a changed fingerprint again on the next run.
+                updates.append((key, record.gundi_event_id, event, fingerprint, ob.obsDt))
             else:
+                record.fingerprint = fingerprint
+                record.obs_dt = ob.obsDt
                 logger.warning(
                     f"eBird observation {key} changed but has no Gundi event ID "
                     f"(sent before per-observation tracking); the edit will not be delivered."
@@ -250,14 +258,38 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
         events_extracted = len(new_events)
 
     events_updated = 0
-    for event_id, event in updates:
+    update_failures = []
+    for key, event_id, event, fingerprint, obs_dt in updates:
+        record = state.observations[key]
         logger.info(f"Updating previously sent event {event_id} in Gundi for integration ID: {str(integration.id)}")
-        await update_event_in_gundi(
-            event_id=event_id,
-            event=event,
-            integration_id=str(integration.id)
-        )
-        events_updated += 1
+        try:
+            await update_event_in_gundi(
+                event_id=event_id,
+                event=event,
+                integration_id=str(integration.id)
+            )
+        except Exception as e:
+            if source_status_code(e) == 404:
+                # The event was deleted in Gundi and will not come back (the
+                # helper does not retry a 404 for the same reason). Drop the id
+                # so this record stops PATCHing a ghost on every edit, and
+                # acknowledge the edit as undeliverable, like a legacy record.
+                logger.warning(
+                    f"Gundi event {event_id} for eBird observation {key} no longer exists; "
+                    f"further edits to it will not be delivered."
+                )
+                record.gundi_event_id = None
+            else:
+                # Leave the record untouched so the next run sees the change
+                # again and retries; keep going so the other edits, and the
+                # state save below, are not lost to one failure.
+                logger.error(f"Failed to update Gundi event {event_id} for eBird observation {key}: {e}")
+                update_failures.append(e)
+                continue
+        else:
+            events_updated += 1
+        record.fingerprint = fingerprint
+        record.obs_dt = obs_dt
 
     # Entries older than the fetch window cannot reappear in a response, so
     # dropping them keeps state size bounded.
@@ -269,6 +301,11 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
         "pull_events",
         json.loads(state.json())
     )
+
+    if update_failures:
+        # Reported only now: state is saved, so the events POSTed this run are
+        # recorded (no duplicates next run) and the failed edits stay retryable.
+        raise update_failures[0]
 
     return {'result': {'events_extracted': events_extracted, 'events_updated': events_updated}}
 
