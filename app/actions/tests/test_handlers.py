@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
+import asyncio
 from unittest.mock import AsyncMock
 
 import httpx
@@ -9,6 +10,7 @@ from app.actions import handlers
 from app.actions.configurations import PullEventsConfig, SearchParameter
 from app.actions.handlers import eBirdObservation
 from app.services.errors import classify_error
+from app.services.gundi import GundiEventNotFound
 from gundi_client_v2.errors import GundiAPIError
 
 
@@ -417,13 +419,13 @@ async def _two_observations_sent(sync_mocks):
 
 @pytest.mark.asyncio
 async def test_update_for_an_event_deleted_in_gundi_does_not_abort_the_run(sync_mocks):
-    # A 404 is deliberately not retried by the Gundi helpers: the event is gone
-    # and will not come back. The run must still finish (state saved, the other
-    # edits delivered) and the record must stop carrying an id that will 404 on
-    # every future edit.
+    # The event PATCH answering 404 means the event is gone and will not come
+    # back (the helper does not retry it either). The run must still finish
+    # (state saved, the other edits delivered) and the record must stop carrying
+    # an id that will 404 on every future edit.
     a, b, first_state = await _two_observations_sent(sync_mocks)
     sync_mocks.ebird.return_value = [dict(a, howMany=5), dict(b, howMany=5)]
-    sync_mocks.update.side_effect = [GundiAPIError(status_code=404, detail="Not found"), {}]
+    sync_mocks.update.side_effect = [GundiEventNotFound("gid-0", detail="Not found"), {}]
 
     result = await handlers.action_pull_events(_make_integration(), _make_config())
 
@@ -464,6 +466,57 @@ async def test_failed_update_is_reported_only_after_state_is_saved(sync_mocks):
     # The successful edit is applied.
     assert state["observations"]["S-2:sp1"]["fingerprint"] != first_state["observations"]["S-2:sp1"]["fingerprint"]
     assert state["observations"]["S-2:sp1"]["gundi_event_id"] == "gid-1"
+
+
+@pytest.mark.asyncio
+async def test_a_404_from_anything_but_the_event_patch_is_a_real_failure(sync_mocks):
+    # update_event_in_gundi also looks the integration up in the portal to get
+    # its API key, and that lookup 404s when the integration row is missing or
+    # misconfigured. That is not a deleted event: clearing the id would make the
+    # observation permanently un-updatable once the portal is repaired. Only
+    # the helper's GundiEventNotFound may be read as "the event is gone".
+    a, b, first_state = await _two_observations_sent(sync_mocks)
+    sync_mocks.ebird.return_value = [dict(a, howMany=5), dict(b, howMany=5)]
+    sync_mocks.update.side_effect = GundiAPIError(status_code=404, detail="Integration not found")
+
+    with pytest.raises(GundiAPIError):
+        await handlers.action_pull_events(_make_integration(), _make_config())
+
+    state = _saved_state(sync_mocks)
+    assert state["observations"]["S-1:sp1"] == first_state["observations"]["S-1:sp1"]
+    assert state["observations"]["S-2:sp1"] == first_state["observations"]["S-2:sp1"]
+
+
+@pytest.mark.asyncio
+async def test_progress_is_checkpointed_before_the_action_timeout_can_cancel_the_run(sync_mocks):
+    # The runner wraps the handler in asyncio.wait_for(MAX_ACTION_EXECUTION_TIME).
+    # Cancellation is a BaseException that no `except Exception` sees, so a
+    # single save at the end of the run loses everything a slow update batch
+    # sat in front of: the ids of events POSTed this run (re-sent next run as
+    # duplicates) and the edits already delivered (re-PATCHed next run).
+    a, b, first_state = await _two_observations_sent(sync_mocks)
+    c = _observation_payload(subId="S-3", speciesCode="sp1", obsDt=_obs_dt(_NEWER), howMany=1)
+    sync_mocks.ebird.return_value = [dict(a, howMany=5), dict(b, howMany=5), c]
+
+    async def first_succeeds_then_hang(**kwargs):
+        if kwargs["event_id"] == "gid-0":
+            return {}
+        await asyncio.sleep(3600)
+
+    sync_mocks.update.side_effect = first_succeeds_then_hang
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            handlers.action_pull_events(_make_integration(), _make_config()), timeout=0.2
+        )
+
+    state = _saved_state(sync_mocks)
+    # The POST that succeeded this run is durable...
+    assert state["observations"]["S-3:sp1"]["gundi_event_id"] == "gid-0"
+    # ...as is the edit that was delivered before the hang...
+    assert state["observations"]["S-1:sp1"]["fingerprint"] != first_state["observations"]["S-1:sp1"]["fingerprint"]
+    # ...while the edit that never completed is left for the next run.
+    assert state["observations"]["S-2:sp1"] == first_state["observations"]["S-2:sp1"]
 
 # --- eBird request timeout and retry -----------------------------------------
 

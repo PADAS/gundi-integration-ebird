@@ -7,9 +7,9 @@ from datetime import datetime, timedelta, timezone
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig, SearchParameter
 from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger
-from app.services.gundi import send_events_to_gundi, update_event_in_gundi
+from app.services.gundi import send_events_to_gundi, update_event_in_gundi, GundiEventNotFound
 from app.services.state import IntegrationStateManager
-from app.services.errors import ConfigurationNotFound, ConfigurationValidationError, source_status_code
+from app.services.errors import ConfigurationNotFound, ConfigurationValidationError
 from app.services.utils import find_config_for_action
 from gundi_core.schemas.v2 import Integration
 from pydantic import BaseModel, Field, parse_obj_as, validator, ValidationError
@@ -256,6 +256,11 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 f"updates will be unavailable for this batch of {len(new_events)} events."
             )
         events_extracted = len(new_events)
+        # Checkpoint: the runner cancels the handler at MAX_ACTION_EXECUTION_TIME
+        # and cancellation bypasses every `except Exception` below, so the ids
+        # just recorded must be durable before the update loop can spend that
+        # budget -- or the next run re-sends these events as new.
+        await _save_state(integration, action_config, state)
 
     events_updated = 0
     update_failures = []
@@ -269,11 +274,13 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
                 integration_id=str(integration.id)
             )
         except Exception as e:
-            if source_status_code(e) == 404:
-                # The event was deleted in Gundi and will not come back (the
-                # helper does not retry a 404 for the same reason). Drop the id
-                # so this record stops PATCHing a ghost on every edit, and
-                # acknowledge the edit as undeliverable, like a legacy record.
+            if isinstance(e, GundiEventNotFound):
+                # The PATCH itself answered 404: the event was deleted in Gundi
+                # and will not come back (the helper does not retry it either).
+                # Drop the id so this record stops PATCHing a ghost on every
+                # edit, and acknowledge the edit as undeliverable, like a
+                # legacy record. Any other 404 (the portal not knowing the
+                # integration, say) takes the branch below and keeps the id.
                 logger.warning(
                     f"Gundi event {event_id} for eBird observation {key} no longer exists; "
                     f"further edits to it will not be delivered."
@@ -290,7 +297,21 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
             events_updated += 1
         record.fingerprint = fingerprint
         record.obs_dt = obs_dt
+        # Checkpoint each delivered (or written-off) edit for the same reason:
+        # a cancellation mid-batch must not undo the PATCHes that landed.
+        await _save_state(integration, action_config, state)
 
+    await _save_state(integration, action_config, state)
+
+    if update_failures:
+        # Reported only now: state is saved, so the events POSTed this run are
+        # recorded (no duplicates next run) and the failed edits stay retryable.
+        raise update_failures[0]
+
+    return {'result': {'events_extracted': events_extracted, 'events_updated': events_updated}}
+
+
+async def _save_state(integration: Integration, action_config: PullEventsConfig, state: State) -> None:
     # Entries older than the fetch window cannot reappear in a response, so
     # dropping them keeps state size bounded.
     prune_cutoff = datetime.now(tz=timezone.utc) - timedelta(days=action_config.num_days + PRUNE_MARGIN_DAYS)
@@ -301,13 +322,6 @@ async def action_pull_events(integration:Integration, action_config: PullEventsC
         "pull_events",
         json.loads(state.json())
     )
-
-    if update_failures:
-        # Reported only now: state is saved, so the events POSTed this run are
-        # recorded (no duplicates next run) and the failed edits stay retryable.
-        raise update_failures[0]
-
-    return {'result': {'events_extracted': events_extracted, 'events_updated': events_updated}}
 
 
 class TransientEbirdError(httpx.HTTPStatusError):

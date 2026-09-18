@@ -20,6 +20,7 @@ import stamina
 # app.settings before gundi_client_v2 (see app/services/errors.py).
 from app import settings  # noqa: F401
 from gundi_client_v2.client import GundiClient, GundiDataSenderClient
+from gundi_client_v2.errors import GundiAPIError
 
 from .activity_logger import ephemeral_run
 from .retry_policies import is_transient_gundi_error
@@ -27,6 +28,23 @@ from .retry_policies import is_transient_gundi_error
 
 class EphemeralWriteBlocked(RuntimeError):
     """Blocked write from a reference/auth handler on the ephemeral path."""
+
+
+class GundiEventNotFound(GundiAPIError):
+    """The event PATCH itself answered 404: the event no longer exists in Gundi.
+
+    Raised only by `update_event_in_gundi`, and only for the PATCH. A 404 from
+    its prerequisites (the integration / API-key lookup in the portal) stays a
+    plain `GundiAPIError`: that is a portal-side problem that a repair fixes,
+    not a deleted event, and a caller that dropped its stored event id on it
+    would leave the event permanently un-updatable. Still a `GundiAPIError`
+    with status 404, so the retry predicate and `classify_error` treat it as
+    the non-retryable Gundi 404 it is.
+    """
+
+    def __init__(self, event_id: str, detail: str = ""):
+        super().__init__(status_code=404, detail=detail)
+        self.event_id = event_id
 
 
 def _block_if_ephemeral(op: str) -> None:
@@ -136,8 +154,15 @@ async def update_event_in_gundi(event_id: str, event: dict, **kwargs) -> dict:
     _block_if_ephemeral("update_event_in_gundi")
     integration_id = kwargs.get("integration_id")
     assert integration_id, "integration_id is required"
+    # Outside the try on purpose: a 404 here is the portal not knowing the
+    # integration, which must not be mistaken for a deleted event.
     sensors_api_client = await _get_sensors_api_client(integration_id=str(integration_id))
-    return await sensors_api_client.update_event(event_id=event_id, data=event)
+    try:
+        return await sensors_api_client.update_event(event_id=event_id, data=event)
+    except GundiAPIError as e:
+        if e.status_code == 404:
+            raise GundiEventNotFound(event_id, detail=e.detail) from e
+        raise
 
 
 @stamina.retry(**GUNDI_API_RETRY)
